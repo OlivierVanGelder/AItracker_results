@@ -40,7 +40,6 @@ async function main() {
   ensureDir(downloadsDir);
 
   const browser = await chromium.launch({ headless: true });
-
   const context = await browser.newContext({
     acceptDownloads: true,
     viewport: { width: 1400, height: 900 }
@@ -60,49 +59,53 @@ async function main() {
     await page.goto(guestUrl, { waitUntil: "domcontentloaded", timeout: exportTimeoutMs });
     await page.waitForTimeout(1500);
 
-    // 1) Eerste knop: export dropdown met file_upload icoon
-    // We zoeken een zichtbare button die een material icon "file_upload" bevat
+    // 1) Bovenste exportknop: herkenbaar aan het material icon "file_upload"
     const topExportBtn = page
       .locator("button:visible")
-      .filter({
-        has: page.locator("i.material-icons:has-text('file_upload')")
-      })
+      .filter({ has: page.locator("i.material-icons:has-text('file_upload')") })
       .first();
 
     await topExportBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
     await topExportBtn.click();
 
-    // 2) Popup moet nu export format buttons tonen
-    const csvLabel = page.locator(".export-format-buttons__btn-label:has-text('CSV(.csv)')").first();
-    const xlsxLabel = page.locator(".export-format-buttons__btn-label:has-text('Excel (.xlsx)')").first();
+    // 2) Wacht tot export popup aanwezig is: export format buttons
+    const formatRoot = page.locator(".export-format-buttons").first();
+    await formatRoot.waitFor({ state: "visible", timeout: exportTimeoutMs });
+
+    const csvBtn = page.locator(".export-format-buttons__btn-label:has-text('CSV(.csv)')").first();
+    const xlsxBtn = page.locator(".export-format-buttons__btn-label:has-text('Excel (.xlsx)')").first();
 
     if (preferredFormat === "CSV") {
-      await csvLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
-      await csvLabel.click();
+      await csvBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
+      await csvBtn.click();
     } else {
-      await xlsxLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
-      await xlsxLabel.click();
+      await xlsxBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
+      await xlsxBtn.click();
     }
 
-    // 3) Laatste exportknop in de popup
-    // We bepalen de popup container via de export format buttons sectie
-    const popup = page.locator(".export-format-buttons").first();
-    await popup.waitFor({ state: "visible", timeout: exportTimeoutMs });
+    // 3) Vind de popup container die óók de footerknoppen bevat
+    // We lopen omhoog vanaf .export-format-buttons tot we een container hebben met minimaal 2 se-button-2 knoppen
+    const popupContainer = formatRoot.locator(
+      "xpath=ancestor::*[.//div[contains(@class,'export-format-buttons')] and .//button[contains(@class,'se-button-2')]][1]"
+    );
 
-    // Zoek binnen dezelfde popup context alle zichtbare buttons met "Exporteren"
-    // Pak de laatste, dat is doorgaans de knop die de download start
-    const exportButtonsInPopup = popup
-      .locator("xpath=ancestor::*[self::div or self::section][1]")
-      .locator("button:visible")
-      .filter({ has: page.locator(".se-button-2__text:has-text('Exporteren')") });
+    await popupContainer.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
-    await exportButtonsInPopup.first().waitFor({ state: "visible", timeout: exportTimeoutMs });
+    // Pak alle zichtbare buttons met class se-button-2 binnen de popup
+    const actionButtons = popupContainer.locator("button.se-button-2:visible");
 
-    const finalExportBtn = exportButtonsInPopup.last();
+    const btnCount = await actionButtons.count();
+    if (btnCount === 0) {
+      throw new Error("Geen actieknoppen gevonden in de export popup container.");
+    }
 
-    // Download watcher en klik altijd samen afhandelen
+    // In vrijwel alle popups is de primaire actie de rechterknop, dus de laatste
+    const finalBtn = actionButtons.nth(btnCount - 1);
+    await finalBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
+
+    // Download watcher en klik altijd beide afhandelen
     const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs });
-    const clickWait = finalExportBtn.click({ timeout: exportTimeoutMs, force: true });
+    const clickWait = finalBtn.click({ timeout: exportTimeoutMs, force: true });
 
     const [downloadResult, clickResult] = await Promise.allSettled([downloadWait, clickWait]);
 
