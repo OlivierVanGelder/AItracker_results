@@ -1,6 +1,5 @@
 // src/run.js
-// Node 18+
-// Vereist: playwright
+// ES module versie (package.json heeft "type": "module")
 //
 // Env vars:
 //   GUEST_URL            = volledige gastenlink naar de rankings pagina
@@ -10,9 +9,14 @@
 //   EXPORT_TIMEOUT_MS    = timeout voor export (default: 240000)
 //   DEBUG                = "true" of "false" (default: true)
 
-const fs = require("fs");
-const path = require("path");
-const { chromium } = require("playwright");
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function nowStamp() {
   return new Date().toISOString().replace(/[:.]/g, "_");
@@ -44,7 +48,6 @@ function pickCsvFilenameFromHeaders(headers) {
 }
 
 async function postToWebhook(webhookUrl, filePath) {
-  // Node 20 heeft fetch ingebouwd
   const data = await fs.promises.readFile(filePath);
   const filename = path.basename(filePath);
 
@@ -80,11 +83,7 @@ async function main() {
 
   const browser = await chromium.launch({
     headless: HEADLESS,
-    args: [
-      "--disable-dev-shm-usage",
-      "--no-sandbox",
-      "--disable-gpu",
-    ],
+    args: ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
   });
 
   const context = await browser.newContext({
@@ -104,54 +103,55 @@ async function main() {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
 
-    // Wacht tot de pagina echt bruikbaar is
     await page.waitForTimeout(1500);
 
-    // 1) Klik de eerste Exporteren knop bovenin (dropdown button)
-    // We targetten de zichtbare knop met tekst Exporteren
-    const topExportBtn = page.locator("button:visible", {
-      has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
-    }).first();
+    // 1) Bovenste Exporteren knop (dropdown)
+    const topExportBtn = page
+      .locator("button:visible", {
+        has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
+      })
+      .first();
 
     await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
     await topExportBtn.click();
 
-    // 2) Popup moet zichtbaar worden
-    // De popup heeft titel "Exporteren"
-    const popupTitle = page.locator("text=Exporteren").first();
-    await popupTitle.waitFor({ state: "visible", timeout: 120000 });
+    // 2) Popup zichtbaar
+    await page.locator("text=Exporteren").first().waitFor({ state: "visible", timeout: 120000 });
 
-    // 3) Selecteer CSV tegel
-    const csvTile = page.locator(".export-format-buttons__btn", {
-      has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
-    }).first();
+    // 3) CSV tegel
+    const csvTile = page
+      .locator(".export-format-buttons__btn", {
+        has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
+      })
+      .first();
 
     await csvTile.waitFor({ state: "visible", timeout: 120000 });
     await csvTile.click();
 
-    // 4) Klik Exporteren in de popup footer
-    // Dit is de primaire button in de popup, zonder arrow
-    const footerExportBtn = page.locator(".export-popup-wrapper__footer button:visible", {
-      has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
-    }).first();
+    // 4) Exporteren knop in footer popup
+    const footerExportBtn = page
+      .locator(".export-popup-wrapper__footer button:visible", {
+        has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
+      })
+      .first();
 
     await footerExportBtn.waitFor({ state: "visible", timeout: 120000 });
 
-    // Belangrijk: we zetten eerst de wait op de uiteindelijke download response,
-    // en klikken daarna pas op de knop.
-    const csvResponsePromise = page.waitForResponse((resp) => {
-      const url = resp.url();
-      if (!url.includes("api.llm_rankings.rankings.export.html")) return false;
-      if (!url.includes("do=download")) return false;
-      const h = resp.headers();
-      const ct = (h["content-type"] || "").toLowerCase();
-      return ct.includes("text/csv");
-    }, { timeout: EXPORT_TIMEOUT_MS });
+    // Wacht specifiek op de uiteindelijke download response (do=download + text/csv)
+    const csvResponsePromise = page.waitForResponse(
+      (resp) => {
+        const url = resp.url();
+        if (!url.includes("api.llm_rankings.rankings.export.html")) return false;
+        if (!url.includes("do=download")) return false;
+        const h = resp.headers();
+        const ct = (h["content-type"] || "").toLowerCase();
+        return ct.includes("text/csv");
+      },
+      { timeout: EXPORT_TIMEOUT_MS }
+    );
 
     await footerExportBtn.click();
 
-    // Optioneel: export progress popup kan even blijven staan
-    // We wachten primair op de download response.
     const csvResp = await csvResponsePromise;
 
     const headers = csvResp.headers();
@@ -159,7 +159,7 @@ async function main() {
     const filename = filenameFromHeader || `export-${nowStamp()}.csv`;
     const outPath = path.join(DOWNLOAD_DIR, filename);
 
-    // Soms is response.body leeg in CI. Dan refetchen we dezelfde URL via page.request.
+    // Soms is response.body leeg in CI. Dan refetchen we via page.request.
     let buf = await csvResp.body().catch(() => Buffer.from(""));
     if (!buf || buf.length === 0) {
       console.log("CSV body leeg via response.body, refetch via page.request:", csvResp.url());
@@ -186,7 +186,7 @@ async function main() {
     await browser.close();
   } catch (err) {
     console.log("Fatal:", err?.message || err);
-    if (DEBUG) await saveDebugArtifacts(page, debugDir, "fail");
+    if (DEBUG) await saveDebugArtifacts(page, path.join(process.cwd(), "debug"), "fail");
     await browser.close();
     process.exit(1);
   }
