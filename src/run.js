@@ -1,298 +1,195 @@
-import "dotenv/config";
-import fs from "fs";
-import path from "path";
-import { chromium } from "@playwright/test";
-import { uploadFile } from "./upload.js";
+// src/run.js
+// Node 18+
+// Vereist: playwright
+//
+// Env vars:
+//   GUEST_URL            = volledige gastenlink naar de rankings pagina
+//   WEBHOOK_URL          = webhook waar je het csv bestand heen post (optioneel)
+//   DOWNLOAD_DIR         = map voor download (default: ./downloads)
+//   HEADLESS             = "true" of "false" (default: true)
+//   EXPORT_TIMEOUT_MS    = timeout voor export (default: 240000)
+//   DEBUG                = "true" of "false" (default: true)
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+const fs = require("fs");
+const path = require("path");
+const { chromium } = require("playwright");
+
+function nowStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "_");
 }
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+async function ensureDir(p) {
+  await fs.promises.mkdir(p, { recursive: true });
 }
 
-async function writeDebugArtifacts(page, extra = {}) {
-  const debugDir = path.resolve("debug");
-  ensureDir(debugDir);
-
-  const ts = new Date().toISOString().replace(/[:.]/g, "_");
-  const screenshotPath = path.join(debugDir, `fail-${ts}.png`);
-  const htmlPath = path.join(debugDir, `fail-${ts}.html`);
-  const jsonPath = path.join(debugDir, `fail-${ts}.json`);
-
-  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-  const html = await page.content().catch(() => "");
-  fs.writeFileSync(htmlPath, html, "utf8");
-  fs.writeFileSync(jsonPath, JSON.stringify(extra, null, 2), "utf8");
-
-  console.log("Debug artifacts saved:", screenshotPath, htmlPath, jsonPath);
-}
-
-function filenameFromContentDisposition(cd) {
-  if (!cd) return null;
-
-  const m1 = cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-  if (m1 && m1[1]) {
-    try {
-      return decodeURIComponent(m1[1].trim().replace(/(^"|"$)/g, ""));
-    } catch {
-      return m1[1].trim().replace(/(^"|"$)/g, "");
-    }
+async function saveDebugArtifacts(page, debugDir, prefix) {
+  try {
+    const ts = nowStamp();
+    const png = path.join(debugDir, `${prefix}-${ts}.png`);
+    const html = path.join(debugDir, `${prefix}-${ts}.html`);
+    await page.screenshot({ path: png, fullPage: true });
+    const content = await page.content();
+    await fs.promises.writeFile(html, content, "utf8");
+    console.log("Debug artifacts saved:", png, html);
+  } catch (e) {
+    console.log("Kon debug artifacts niet opslaan:", e?.message || e);
   }
-
-  const m2 = cd.match(/filename\s*=\s*("?)([^";]+)\1/i);
-  if (m2 && m2[2]) return m2[2].trim();
-
-  return null;
 }
 
-function extFromContentType(ct, fallback = "csv") {
-  const t = (ct || "").toLowerCase();
-  if (t.includes("text/csv")) return "csv";
-  if (t.includes("spreadsheetml")) return "xlsx";
-  if (t.includes("application/vnd.ms-excel")) return "xls";
-  return fallback;
+function pickCsvFilenameFromHeaders(headers) {
+  const cd = headers["content-disposition"] || headers["Content-Disposition"] || "";
+  const m = cd.match(/filename="([^"]+)"/i) || cd.match(/filename=([^;]+)/i);
+  if (!m) return null;
+  return m[1].replace(/(^"|"$)/g, "").trim();
 }
 
-function looksLikeFileResponse(headers) {
-  const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
-  const cd = (headers["content-disposition"] || headers["Content-Disposition"] || "").toLowerCase();
+async function postToWebhook(webhookUrl, filePath) {
+  // Node 20 heeft fetch ingebouwd
+  const data = await fs.promises.readFile(filePath);
+  const filename = path.basename(filePath);
 
-  const isAttachment = cd.includes("attachment");
-  const isCsv = ct.includes("text/csv");
-  const isXlsx = ct.includes("spreadsheetml") || ct.includes("application/vnd.ms-excel");
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "text/csv",
+      "x-filename": filename,
+    },
+    body: data,
+  });
 
-  // let op: image/gif is hier juist NIET goed
-  const isGif = ct.includes("image/gif");
-
-  if (isGif) return { ok: false, reason: "gif" };
-  if (isAttachment || isCsv || isXlsx) return { ok: true, ct, cd };
-  return { ok: false, reason: "not-file" };
+  const txt = await res.text().catch(() => "");
+  if (!res.ok) {
+    throw new Error(`Webhook error status=${res.status} body=${txt.slice(0, 500)}`);
+  }
+  console.log("Webhook OK:", res.status);
 }
 
 async function main() {
-  const guestUrl = requireEnv("SE_RANKING_GUEST_URL");
-  const webhookUrl = requireEnv("WEBHOOK_URL");
+  const GUEST_URL = process.env.GUEST_URL;
+  if (!GUEST_URL) throw new Error("Zet env var GUEST_URL");
 
-  const exportTimeoutMs = Number(process.env.EXPORT_TIMEOUT_MS || "240000");
-  const preferredFormat = (process.env.EXPORT_FORMAT || "CSV").toUpperCase();
+  const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+  const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), "downloads");
+  const DEBUG = (process.env.DEBUG || "true").toLowerCase() === "true";
+  const HEADLESS = (process.env.HEADLESS || "true").toLowerCase() === "true";
+  const EXPORT_TIMEOUT_MS = Number(process.env.EXPORT_TIMEOUT_MS || "240000");
 
-  const downloadsDir = path.resolve("downloads");
-  ensureDir(downloadsDir);
+  const debugDir = path.join(process.cwd(), "debug");
+  await ensureDir(DOWNLOAD_DIR);
+  await ensureDir(debugDir);
 
-  const networkLog = [];
-  let fileCandidate = null;
+  const browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      "--disable-dev-shm-usage",
+      "--no-sandbox",
+      "--disable-gpu",
+    ],
+  });
 
-  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     acceptDownloads: true,
-    viewport: { width: 1400, height: 900 }
+    viewport: { width: 1400, height: 900 },
   });
 
   const page = await context.newPage();
 
-  page.on("console", (msg) => console.log(`[browser ${msg.type()}] ${msg.text()}`));
-  page.on("pageerror", (err) => console.log("[pageerror]", err?.message || String(err)));
-
-  page.on("request", (req) => {
-    const url = req.url();
-    if (
-      url.includes("export") ||
-      url.includes("download") ||
-      url.includes("llm_rankings.rankings.export") ||
-      url.endsWith(".csv") ||
-      url.endsWith(".xlsx")
-    ) {
-      networkLog.push({
-        type: "request",
-        url,
-        method: req.method(),
-        ts: new Date().toISOString()
-      });
-    }
-  });
-
-  page.on("response", async (res) => {
-    const url = res.url();
-    const status = res.status();
-    const headers = await res.allHeaders().catch(() => ({}));
-
-    const interesting =
-      url.includes("export") ||
-      url.includes("download") ||
-      url.includes("llm_rankings.rankings.export") ||
-      url.endsWith(".csv") ||
-      url.endsWith(".xlsx");
-
-    if (interesting) {
-      networkLog.push({
-        type: "response",
-        url,
-        status,
-        headers: {
-          "content-type": headers["content-type"] || headers["Content-Type"] || "",
-          "content-disposition": headers["content-disposition"] || headers["Content-Disposition"] || "",
-          location: headers["location"] || headers["Location"] || ""
-        },
-        ts: new Date().toISOString()
-      });
-    }
-
-    // Detecteer het echte bestand
-    const verdict = looksLikeFileResponse(headers);
-    if (!verdict.ok) return;
-
-    // We pakken de eerste geldige file response en bewaren hem
-    if (!fileCandidate) {
-      fileCandidate = { res, headers, url, status };
-    }
+  page.on("console", (msg) => {
+    const t = msg.type();
+    if (t === "error") console.log("[browser error]", msg.text());
+    if (t === "warning") console.log("[browser warning]", msg.text());
   });
 
   try {
-    await page.goto(guestUrl, { waitUntil: "domcontentloaded", timeout: exportTimeoutMs });
+    console.log("Open:", GUEST_URL);
+    await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+
+    // Wacht tot de pagina echt bruikbaar is
     await page.waitForTimeout(1500);
 
-    // Open export popup via file_upload icon
-    const topExportBtn = page
-      .locator("button:visible")
-      .filter({ has: page.locator("i.material-icons:has-text('file_upload')") })
-      .first();
+    // 1) Klik de eerste Exporteren knop bovenin (dropdown button)
+    // We targetten de zichtbare knop met tekst Exporteren
+    const topExportBtn = page.locator("button:visible", {
+      has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
+    }).first();
 
-    await topExportBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
+    await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
     await topExportBtn.click();
 
-    const formatRoot = page.locator(".export-format-buttons").first();
-    await formatRoot.waitFor({ state: "visible", timeout: exportTimeoutMs });
+    // 2) Popup moet zichtbaar worden
+    // De popup heeft titel "Exporteren"
+    const popupTitle = page.locator("text=Exporteren").first();
+    await popupTitle.waitFor({ state: "visible", timeout: 120000 });
 
-    // Kies formaat
-    const csvLabel = page.locator(".export-format-buttons__btn-label:has-text('CSV(.csv)')").first();
-    const xlsxLabel = page.locator(".export-format-buttons__btn-label:has-text('Excel (.xlsx)')").first();
+    // 3) Selecteer CSV tegel
+    const csvTile = page.locator(".export-format-buttons__btn", {
+      has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
+    }).first();
 
-    if (preferredFormat === "CSV") {
-      await csvLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
-      await csvLabel.click();
+    await csvTile.waitFor({ state: "visible", timeout: 120000 });
+    await csvTile.click();
+
+    // 4) Klik Exporteren in de popup footer
+    // Dit is de primaire button in de popup, zonder arrow
+    const footerExportBtn = page.locator(".export-popup-wrapper__footer button:visible", {
+      has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
+    }).first();
+
+    await footerExportBtn.waitFor({ state: "visible", timeout: 120000 });
+
+    // Belangrijk: we zetten eerst de wait op de uiteindelijke download response,
+    // en klikken daarna pas op de knop.
+    const csvResponsePromise = page.waitForResponse((resp) => {
+      const url = resp.url();
+      if (!url.includes("api.llm_rankings.rankings.export.html")) return false;
+      if (!url.includes("do=download")) return false;
+      const h = resp.headers();
+      const ct = (h["content-type"] || "").toLowerCase();
+      return ct.includes("text/csv");
+    }, { timeout: EXPORT_TIMEOUT_MS });
+
+    await footerExportBtn.click();
+
+    // Optioneel: export progress popup kan even blijven staan
+    // We wachten primair op de download response.
+    const csvResp = await csvResponsePromise;
+
+    const headers = csvResp.headers();
+    const filenameFromHeader = pickCsvFilenameFromHeaders(headers);
+    const filename = filenameFromHeader || `export-${nowStamp()}.csv`;
+    const outPath = path.join(DOWNLOAD_DIR, filename);
+
+    // Soms is response.body leeg in CI. Dan refetchen we dezelfde URL via page.request.
+    let buf = await csvResp.body().catch(() => Buffer.from(""));
+    if (!buf || buf.length === 0) {
+      console.log("CSV body leeg via response.body, refetch via page.request:", csvResp.url());
+      const refetch = await page.request.get(csvResp.url(), { timeout: EXPORT_TIMEOUT_MS });
+      if (!refetch.ok()) {
+        throw new Error(`Refetch faalt status=${refetch.status()} url=${csvResp.url()}`);
+      }
+      const refBuf = await refetch.body();
+      if (!refBuf || refBuf.length === 0) {
+        throw new Error("CSV body blijft leeg na refetch");
+      }
+      buf = refBuf;
+    }
+
+    await fs.promises.writeFile(outPath, buf);
+    console.log("CSV opgeslagen:", outPath, "bytes:", buf.length);
+
+    if (WEBHOOK_URL) {
+      await postToWebhook(WEBHOOK_URL, outPath);
     } else {
-      await xlsxLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
-      await xlsxLabel.click();
+      console.log("WEBHOOK_URL niet gezet, alleen lokaal opgeslagen.");
     }
 
-    // Vind popup container en klik laatste export knop
-    const popupContainer = formatRoot.locator(
-      "xpath=ancestor::*[.//div[contains(@class,'export-format-buttons')] and .//button[contains(@class,'se-button-2')]][1]"
-    );
-    await popupContainer.waitFor({ state: "visible", timeout: exportTimeoutMs });
-
-    const actionButtons = popupContainer.locator("button.se-button-2:visible");
-    const btnCount = await actionButtons.count();
-    if (btnCount === 0) throw new Error("Geen actieknoppen gevonden in de export popup.");
-
-    const finalBtn = actionButtons.nth(btnCount - 1);
-    await finalBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
-
-    // Wacht op download event, of een file response die we via response listener vinden
-    const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs }).catch(() => null);
-
-    await finalBtn.click({ timeout: exportTimeoutMs, force: true });
-    // Na de laatste klik: wacht op "export bezig" popup en dat hij weer verdwijnt
-    const exportingDialog = page.locator("text=Exporteren van bestand is bezig").first();
-
-    // soms komt hij niet altijd, dus: try wachten op zichtbaar, maar fail niet hard
-    await exportingDialog.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
-
-    // nu wachten tot hij weg is (export klaar)
-    await exportingDialog.waitFor({ state: "hidden", timeout: exportTimeoutMs }).catch(() => {
-    // Als hij blijft hangen, maken we debug, maar we gooien nog niet direct
-    });
-
-    // Extra buffer voor het moment dat de download pas ná het sluiten start
-    await page.waitForTimeout(2000);
-
-
-    // Poll op fileCandidate, omdat responses async binnenkomen
-    const started = Date.now();
-    while (!fileCandidate && Date.now() - started < exportTimeoutMs) {
-      const dl = await Promise.race([
-        downloadWait,
-        new Promise((r) => setTimeout(() => r(null), 500))
-      ]);
-
-      if (dl) {
-        const suggestedName =
-          dl.suggestedFilename() || `export.${preferredFormat === "CSV" ? "csv" : "xlsx"}`;
-        const filePath = path.join(downloadsDir, suggestedName);
-        await dl.saveAs(filePath);
-
-        const result = await uploadFile({
-          webhookUrl,
-          filePath,
-          extraFields: {
-            source: "se-ranking-ai-search-guest-export",
-            filename: suggestedName,
-            format: preferredFormat,
-            method: "download-event"
-          }
-        });
-
-        console.log("Export downloaded:", filePath);
-        console.log("Webhook response:", result || "(empty)");
-        return;
-      }
-    }
-
-    // Als we een response met bestand headers hebben gevonden, body opslaan
-    if (fileCandidate) {
-      const { res, headers } = fileCandidate;
-
-      const ct = headers["content-type"] || headers["Content-Type"] || "";
-      const cd = headers["content-disposition"] || headers["Content-Disposition"] || "";
-
-      const ext = extFromContentType(ct, preferredFormat === "CSV" ? "csv" : "xlsx");
-      const nameFromHeader = filenameFromContentDisposition(cd);
-      const suggestedName = nameFromHeader || `export.${ext}`;
-      const filePath = path.join(downloadsDir, suggestedName);
-
-      const buf = await res.body().catch(() => null);
-      if (!buf || buf.length === 0) {
-        throw new Error(`Bestand response gevonden maar body is leeg. ct=${ct} cd=${cd}`);
-      }
-
-      fs.writeFileSync(filePath, buf);
-
-      const result = await uploadFile({
-        webhookUrl,
-        filePath,
-        extraFields: {
-          source: "se-ranking-ai-search-guest-export",
-          filename: suggestedName,
-          format: preferredFormat,
-          method: "file-response-body"
-        }
-      });
-
-      console.log("Export saved from response:", filePath);
-      console.log("Webhook response:", result || "(empty)");
-      return;
-    }
-
-    // Geen download event, geen file response
-    throw new Error("Export geklikt, maar geen download event en geen file response gezien.");
+    await browser.close();
   } catch (err) {
-    console.error(err);
-    await writeDebugArtifacts(page, {
-      error: String(err?.message || err),
-      network: networkLog.slice(-120)
-    });
-    throw err;
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    console.log("Fatal:", err?.message || err);
+    if (DEBUG) await saveDebugArtifacts(page, debugDir, "fail");
+    await browser.close();
+    process.exit(1);
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+main();
