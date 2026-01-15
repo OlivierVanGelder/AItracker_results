@@ -26,7 +26,6 @@ async function writeDebugArtifacts(page, extra = {}) {
   await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
   const html = await page.content().catch(() => "");
   fs.writeFileSync(htmlPath, html, "utf8");
-
   fs.writeFileSync(jsonPath, JSON.stringify(extra, null, 2), "utf8");
 
   console.log("Debug artifacts saved:", screenshotPath, htmlPath, jsonPath);
@@ -50,101 +49,28 @@ function filenameFromContentDisposition(cd) {
   return null;
 }
 
-function extFromContentType(ct, preferredFormat) {
+function extFromContentType(ct, fallback = "csv") {
   const t = (ct || "").toLowerCase();
   if (t.includes("text/csv")) return "csv";
   if (t.includes("spreadsheetml")) return "xlsx";
   if (t.includes("application/vnd.ms-excel")) return "xls";
-  if (preferredFormat === "CSV") return "csv";
-  return "xlsx";
+  return fallback;
 }
 
-function looksLikeExportUrl(url) {
-  const u = (url || "").toLowerCase();
-  return u.includes("export") || u.includes("download") || u.includes("file");
-}
+function looksLikeFileResponse(headers) {
+  const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
+  const cd = (headers["content-disposition"] || headers["Content-Disposition"] || "").toLowerCase();
 
-function pickSafeHeaders(allHeaders) {
-  const h = {};
-  const allow = new Set([
-    "accept",
-    "accept-language",
-    "content-type",
-    "x-requested-with",
-    "origin",
-    "referer"
-  ]);
+  const isAttachment = cd.includes("attachment");
+  const isCsv = ct.includes("text/csv");
+  const isXlsx = ct.includes("spreadsheetml") || ct.includes("application/vnd.ms-excel");
 
-  for (const [k, v] of Object.entries(allHeaders || {})) {
-    const key = k.toLowerCase();
-    if (allow.has(key)) h[key] = v;
-  }
-  return h;
-}
+  // let op: image/gif is hier juist NIET goed
+  const isGif = ct.includes("image/gif");
 
-async function fetchLikeBrowser(context, req, timeoutMs) {
-  const url = req.url();
-  const method = req.method();
-  const headersAll = await req.allHeaders().catch(() => ({}));
-  const headers = pickSafeHeaders(headersAll);
-
-  const postDataBuffer = req.postDataBuffer ? req.postDataBuffer() : null;
-
-  const res = await context.request.fetch(url, {
-    method,
-    headers,
-    data: postDataBuffer || undefined,
-    timeout: timeoutMs,
-    maxRedirects: 10
-  });
-
-  const resHeaders = res.headers();
-  const status = res.status();
-  const ok = res.ok();
-
-  let buffer = null;
-  let text = null;
-
-  try {
-    buffer = await res.body();
-  } catch {
-    buffer = null;
-  }
-
-  if (!buffer || buffer.length === 0) {
-    try {
-      text = await res.text();
-    } catch {
-      text = null;
-    }
-  }
-
-  return { ok, status, resHeaders, buffer, text, url, method };
-}
-
-function findDownloadUrlInJsonText(txt) {
-  if (!txt) return null;
-
-  try {
-    const j = JSON.parse(txt);
-
-    const candidates = [
-      j.download_url,
-      j.downloadUrl,
-      j.file_url,
-      j.fileUrl,
-      j.url,
-      j.result?.url,
-      j.data?.url,
-      j.data?.download_url,
-      j.data?.downloadUrl
-    ].filter(Boolean);
-
-    const first = candidates.find((x) => typeof x === "string" && x.startsWith("http"));
-    return first || null;
-  } catch {
-    return null;
-  }
+  if (isGif) return { ok: false, reason: "gif" };
+  if (isAttachment || isCsv || isXlsx) return { ok: true, ct, cd };
+  return { ok: false, reason: "not-file" };
 }
 
 async function main() {
@@ -157,7 +83,8 @@ async function main() {
   const downloadsDir = path.resolve("downloads");
   ensureDir(downloadsDir);
 
-  const debugNetwork = [];
+  const networkLog = [];
+  let fileCandidate = null;
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -167,18 +94,19 @@ async function main() {
 
   const page = await context.newPage();
 
-  page.on("console", (msg) => {
-    console.log(`[browser ${msg.type()}] ${msg.text()}`);
-  });
-
-  page.on("pageerror", (err) => {
-    console.log("[pageerror]", err?.message || String(err));
-  });
+  page.on("console", (msg) => console.log(`[browser ${msg.type()}] ${msg.text()}`));
+  page.on("pageerror", (err) => console.log("[pageerror]", err?.message || String(err)));
 
   page.on("request", (req) => {
     const url = req.url();
-    if (looksLikeExportUrl(url)) {
-      debugNetwork.push({
+    if (
+      url.includes("export") ||
+      url.includes("download") ||
+      url.includes("llm_rankings.rankings.export") ||
+      url.endsWith(".csv") ||
+      url.endsWith(".xlsx")
+    ) {
+      networkLog.push({
         type: "request",
         url,
         method: req.method(),
@@ -189,26 +117,45 @@ async function main() {
 
   page.on("response", async (res) => {
     const url = res.url();
-    if (!looksLikeExportUrl(url)) return;
-
+    const status = res.status();
     const headers = await res.allHeaders().catch(() => ({}));
-    debugNetwork.push({
-      type: "response",
-      url,
-      status: res.status(),
-      headers: {
-        "content-type": headers["content-type"] || headers["Content-Type"],
-        "content-disposition": headers["content-disposition"] || headers["Content-Disposition"]
-      },
-      ts: new Date().toISOString()
-    });
+
+    const interesting =
+      url.includes("export") ||
+      url.includes("download") ||
+      url.includes("llm_rankings.rankings.export") ||
+      url.endsWith(".csv") ||
+      url.endsWith(".xlsx");
+
+    if (interesting) {
+      networkLog.push({
+        type: "response",
+        url,
+        status,
+        headers: {
+          "content-type": headers["content-type"] || headers["Content-Type"] || "",
+          "content-disposition": headers["content-disposition"] || headers["Content-Disposition"] || "",
+          location: headers["location"] || headers["Location"] || ""
+        },
+        ts: new Date().toISOString()
+      });
+    }
+
+    // Detecteer het echte bestand
+    const verdict = looksLikeFileResponse(headers);
+    if (!verdict.ok) return;
+
+    // We pakken de eerste geldige file response en bewaren hem
+    if (!fileCandidate) {
+      fileCandidate = { res, headers, url, status };
+    }
   });
 
   try {
     await page.goto(guestUrl, { waitUntil: "domcontentloaded", timeout: exportTimeoutMs });
     await page.waitForTimeout(1500);
 
-    // 1) Bovenste export knop: file_upload icon
+    // Open export popup via file_upload icon
     const topExportBtn = page
       .locator("button:visible")
       .filter({ has: page.locator("i.material-icons:has-text('file_upload')") })
@@ -217,10 +164,10 @@ async function main() {
     await topExportBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
     await topExportBtn.click();
 
-    // 2) Popup zichtbaar
     const formatRoot = page.locator(".export-format-buttons").first();
     await formatRoot.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
+    // Kies formaat
     const csvLabel = page.locator(".export-format-buttons__btn-label:has-text('CSV(.csv)')").first();
     const xlsxLabel = page.locator(".export-format-buttons__btn-label:has-text('Excel (.xlsx)')").first();
 
@@ -232,7 +179,7 @@ async function main() {
       await xlsxLabel.click();
     }
 
-    // 3) Klik laatste actieknop in popup container
+    // Vind popup container en klik laatste export knop
     const popupContainer = formatRoot.locator(
       "xpath=ancestor::*[.//div[contains(@class,'export-format-buttons')] and .//button[contains(@class,'se-button-2')]][1]"
     );
@@ -245,71 +192,60 @@ async function main() {
     const finalBtn = actionButtons.nth(btnCount - 1);
     await finalBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
-    // 4) Strategie: download event, of export request kopieren en via context.request.fetch uitvoeren
+    // Wacht op download event, of een file response die we via response listener vinden
     const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs }).catch(() => null);
-
-    const exportRequestWait = page.waitForRequest(
-      (req) => looksLikeExportUrl(req.url()) && (req.method() === "POST" || req.method() === "GET"),
-      { timeout: exportTimeoutMs }
-    ).catch(() => null);
 
     await finalBtn.click({ timeout: exportTimeoutMs, force: true });
 
-    const maybeDownload = await Promise.race([
-      downloadWait.then((d) => ({ kind: "download", value: d })),
-      exportRequestWait.then((r) => ({ kind: "request", value: r })),
-      new Promise((resolve) => setTimeout(() => resolve({ kind: "none", value: null }), exportTimeoutMs))
-    ]);
+    // Poll op fileCandidate, omdat responses async binnenkomen
+    const started = Date.now();
+    while (!fileCandidate && Date.now() - started < exportTimeoutMs) {
+      const dl = await Promise.race([
+        downloadWait,
+        new Promise((r) => setTimeout(() => r(null), 500))
+      ]);
 
-    if (maybeDownload.kind === "download" && maybeDownload.value) {
-      const download = maybeDownload.value;
-      const suggestedName =
-        download.suggestedFilename() || `export.${preferredFormat === "CSV" ? "csv" : "xlsx"}`;
-      const filePath = path.join(downloadsDir, suggestedName);
+      if (dl) {
+        const suggestedName =
+          dl.suggestedFilename() || `export.${preferredFormat === "CSV" ? "csv" : "xlsx"}`;
+        const filePath = path.join(downloadsDir, suggestedName);
+        await dl.saveAs(filePath);
 
-      await download.saveAs(filePath);
+        const result = await uploadFile({
+          webhookUrl,
+          filePath,
+          extraFields: {
+            source: "se-ranking-ai-search-guest-export",
+            filename: suggestedName,
+            format: preferredFormat,
+            method: "download-event"
+          }
+        });
 
-      const result = await uploadFile({
-        webhookUrl,
-        filePath,
-        extraFields: {
-          source: "se-ranking-ai-search-guest-export",
-          filename: suggestedName,
-          format: preferredFormat,
-          method: "download-event"
-        }
-      });
-
-      console.log("Export downloaded:", filePath);
-      console.log("Webhook response:", result || "(empty)");
-      return;
+        console.log("Export downloaded:", filePath);
+        console.log("Webhook response:", result || "(empty)");
+        return;
+      }
     }
 
-    if (maybeDownload.kind !== "request" || !maybeDownload.value) {
-      throw new Error("Geen download event en geen export request gezien na export klik.");
-    }
+    // Als we een response met bestand headers hebben gevonden, body opslaan
+    if (fileCandidate) {
+      const { res, headers } = fileCandidate;
 
-    const exportReq = maybeDownload.value;
+      const ct = headers["content-type"] || headers["Content-Type"] || "";
+      const cd = headers["content-disposition"] || headers["Content-Disposition"] || "";
 
-    // 5) Voer dezelfde export call nogmaals uit via API request context
-    const fetched = await fetchLikeBrowser(context, exportReq, exportTimeoutMs);
-
-    const ct = fetched.resHeaders["content-type"] || fetched.resHeaders["Content-Type"];
-    const cd = fetched.resHeaders["content-disposition"] || fetched.resHeaders["Content-Disposition"];
-
-    const isAttachment = cd && /attachment/i.test(cd);
-    const looksLikeFile =
-      (ct || "").toLowerCase().includes("text/csv") ||
-      (ct || "").toLowerCase().includes("spreadsheetml") ||
-      (ct || "").toLowerCase().includes("application/vnd.ms-excel");
-
-    if (fetched.ok && (isAttachment || looksLikeFile) && fetched.buffer && fetched.buffer.length > 0) {
-      const ext = extFromContentType(ct, preferredFormat);
+      const ext = extFromContentType(ct, preferredFormat === "CSV" ? "csv" : "xlsx");
       const nameFromHeader = filenameFromContentDisposition(cd);
       const suggestedName = nameFromHeader || `export.${ext}`;
       const filePath = path.join(downloadsDir, suggestedName);
 
-      fs.writeFileSync(filePath, fetched.buffer);
+      const buf = await res.body().catch(() => null);
+      if (!buf || buf.length === 0) {
+        throw new Error(`Bestand response gevonden maar body is leeg. ct=${ct} cd=${cd}`);
+      }
+
+      fs.writeFileSync(filePath, buf);
 
       const result = await uploadFile({
         webhookUrl,
@@ -318,60 +254,22 @@ async function main() {
           source: "se-ranking-ai-search-guest-export",
           filename: suggestedName,
           format: preferredFormat,
-          method: "request-fetch-bytes"
+          method: "file-response-body"
         }
       });
 
-      console.log("Export saved:", filePath);
+      console.log("Export saved from response:", filePath);
       console.log("Webhook response:", result || "(empty)");
       return;
     }
 
-    // 6) Als het JSON teruggeeft met een download URL, haal die alsnog op
-    const downloadUrlFromJson = findDownloadUrlInJsonText(fetched.text);
-
-    if (fetched.ok && downloadUrlFromJson) {
-      const res2 = await context.request.get(downloadUrlFromJson, { timeout: exportTimeoutMs, maxRedirects: 10 });
-      if (!res2.ok()) {
-        throw new Error(`Download URL ophalen faalde: ${res2.status()} ${res2.statusText()}`);
-      }
-
-      const h2 = res2.headers();
-      const ct2 = h2["content-type"] || h2["Content-Type"];
-      const cd2 = h2["content-disposition"] || h2["Content-Disposition"];
-
-      const ext2 = extFromContentType(ct2, preferredFormat);
-      const name2 = filenameFromContentDisposition(cd2) || `export.${ext2}`;
-      const filePath = path.join(downloadsDir, name2);
-
-      const buf2 = await res2.body();
-      fs.writeFileSync(filePath, buf2);
-
-      const result = await uploadFile({
-        webhookUrl,
-        filePath,
-        extraFields: {
-          source: "se-ranking-ai-search-guest-export",
-          filename: name2,
-          format: preferredFormat,
-          method: "json-to-download-url"
-        }
-      });
-
-      console.log("Export saved via download URL:", filePath);
-      console.log("Webhook response:", result || "(empty)");
-      return;
-    }
-
-    // 7) Niks bruikbaars, dump meer info in debug
-    throw new Error(
-      `Export request uitgevoerd, maar geen bestand ontvangen. status=${fetched.status} ct=${ct || ""} cd=${cd || ""}`
-    );
+    // Geen download event, geen file response
+    throw new Error("Export geklikt, maar geen download event en geen file response gezien.");
   } catch (err) {
     console.error(err);
     await writeDebugArtifacts(page, {
       error: String(err?.message || err),
-      network: debugNetwork.slice(-80)
+      network: networkLog.slice(-120)
     });
     throw err;
   } finally {
