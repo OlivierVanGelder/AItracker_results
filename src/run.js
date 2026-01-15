@@ -29,11 +29,6 @@ async function writeDebugArtifacts(page) {
   console.log("Debug artifacts saved:", screenshotPath, htmlPath);
 }
 
-async function clickFirstVisible(locator, timeoutMs = 5000) {
-  await locator.first().waitFor({ state: "visible", timeout: timeoutMs });
-  await locator.first().click();
-}
-
 async function main() {
   const guestUrl = requireEnv("SE_RANKING_GUEST_URL");
   const webhookUrl = requireEnv("WEBHOOK_URL");
@@ -44,9 +39,7 @@ async function main() {
   const downloadsDir = path.resolve("downloads");
   ensureDir(downloadsDir);
 
-  const browser = await chromium.launch({
-    headless: true
-  });
+  const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
     acceptDownloads: true,
@@ -67,77 +60,49 @@ async function main() {
     await page.goto(guestUrl, { waitUntil: "domcontentloaded", timeout: exportTimeoutMs });
     await page.waitForTimeout(1500);
 
-    // 1) Open export popup: klik de exportknop rechtsboven
-    // We vertrouwen hier niet op tekst, maar op het feit dat het een button is in de header.
-    // Als er meerdere buttons staan, pakken we degene die "export" in attributes of tekst heeft,
-    // en vallen we terug op de eerste button in de rechterheader.
-    const exportBtnCandidates = page.locator("button").filter({
-      has: page.locator("svg, span, i")
-    });
+    // 1) Eerste knop: export dropdown met file_upload icoon
+    // We zoeken een zichtbare button die een material icon "file_upload" bevat
+    const topExportBtn = page
+      .locator("button:visible")
+      .filter({
+        has: page.locator("i.material-icons:has-text('file_upload')")
+      })
+      .first();
 
-    // Eerst proberen: knop met "export" in tekst of aria-label (case insensitive)
-    const exportByAttrOrText = page.locator(
-      "button[aria-label*='export' i], button:has-text('Export'):has-text('e'), button:has-text('EXPORT')"
-    );
+    await topExportBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
+    await topExportBtn.click();
 
-    if (await exportByAttrOrText.first().isVisible().catch(() => false)) {
-      await exportByAttrOrText.first().click();
-    } else {
-      // Fallback: jouw UI heeft exportknop rechtsboven, vaak de eerste/ tweede in dat cluster.
-      // We pakken de eerste zichtbare button die niet “Voeg prompts toe” is.
-      const safeExportBtn = page
-        .locator("button")
-        .filter({ hasNot: page.getByText(/Voeg prompts toe/i) })
-        .first();
+    // 2) Popup moet nu export format buttons tonen
+    const csvLabel = page.locator(".export-format-buttons__btn-label:has-text('CSV(.csv)')").first();
+    const xlsxLabel = page.locator(".export-format-buttons__btn-label:has-text('Excel (.xlsx)')").first();
 
-      await safeExportBtn.click();
-    }
-
-    // 2) Wacht op export popup door te zoeken naar elementen die typisch in die popup zitten:
-    // een optie met .csv en/of .xlsx
-    const csvOption = page.locator("text=/\\.csv/i").first();
-    const xlsxOption = page.locator("text=/\\.xlsx/i").first();
-
-    await Promise.race([
-      csvOption.waitFor({ state: "visible", timeout: exportTimeoutMs }).catch(() => {}),
-      xlsxOption.waitFor({ state: "visible", timeout: exportTimeoutMs }).catch(() => {})
-    ]);
-
-    const csvVisible = await csvOption.isVisible().catch(() => false);
-    const xlsxVisible = await xlsxOption.isVisible().catch(() => false);
-
-    if (!csvVisible && !xlsxVisible) {
-      throw new Error("Export popup lijkt niet geopend: geen .csv of .xlsx optie gevonden.");
-    }
-
-    // 3) Klik formaat
     if (preferredFormat === "CSV") {
-      if (!csvVisible) {
-        throw new Error("CSV optie niet zichtbaar in export popup.");
-      }
-      await csvOption.click();
+      await csvLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
+      await csvLabel.click();
     } else {
-      if (!xlsxVisible) {
-        throw new Error("XLSX optie niet zichtbaar in export popup.");
-      }
-      await xlsxOption.click();
+      await xlsxLabel.waitFor({ state: "visible", timeout: exportTimeoutMs });
+      await xlsxLabel.click();
     }
 
-    // 4) Klik primaire actieknop in popup (de rechterknop in footer)
-    // We pakken knoppen die in de buurt staan van de opties.
-    // Vervolgens kiezen we de laatste zichtbare button in dat popup gebied.
-    const popupRegion = csvOption.locator("xpath=ancestor::*[self::div or self::section][1]");
-    const actionButtons = popupRegion.locator("button");
+    // 3) Laatste exportknop in de popup
+    // We bepalen de popup container via de export format buttons sectie
+    const popup = page.locator(".export-format-buttons").first();
+    await popup.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
-    await actionButtons.first().waitFor({ state: "visible", timeout: exportTimeoutMs });
+    // Zoek binnen dezelfde popup context alle zichtbare buttons met "Exporteren"
+    // Pak de laatste, dat is doorgaans de knop die de download start
+    const exportButtonsInPopup = popup
+      .locator("xpath=ancestor::*[self::div or self::section][1]")
+      .locator("button:visible")
+      .filter({ has: page.locator(".se-button-2__text:has-text('Exporteren')") });
 
-    // Vaak staan er 2 knoppen: Annuleren links, Exporteren rechts.
-    // Kies de laatste zichtbare button.
-    const lastButton = actionButtons.last();
+    await exportButtonsInPopup.first().waitFor({ state: "visible", timeout: exportTimeoutMs });
 
-    // 5) Download watcher + click altijd samen afhandelen
+    const finalExportBtn = exportButtonsInPopup.last();
+
+    // Download watcher en klik altijd samen afhandelen
     const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs });
-    const clickWait = lastButton.click({ timeout: exportTimeoutMs, force: true });
+    const clickWait = finalExportBtn.click({ timeout: exportTimeoutMs, force: true });
 
     const [downloadResult, clickResult] = await Promise.allSettled([downloadWait, clickWait]);
 
@@ -151,8 +116,9 @@ async function main() {
     }
 
     const download = downloadResult.value;
-    const suggestedName =
-      download.suggestedFilename() || `export.${preferredFormat === "CSV" ? "csv" : "xlsx"}`;
+
+    const ext = preferredFormat === "CSV" ? "csv" : "xlsx";
+    const suggestedName = download.suggestedFilename() || `export.${ext}`;
     const filePath = path.join(downloadsDir, suggestedName);
 
     await download.saveAs(filePath);
