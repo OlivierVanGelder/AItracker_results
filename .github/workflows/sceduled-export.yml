@@ -30,5 +30,6 @@ jobs:
           SE_RANKING_GUEST_URL: ${{ secrets.SE_RANKING_GUEST_URL }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           EXPORT_BUTTON_TEXT: ${{ secrets.EXPORT_BUTTON_TEXT }}
+          EXPORT_FORMAT: ${{ secrets.EXPORT_FORMAT }}
           EXPORT_TIMEOUT_MS: "120000"
         run: npm start
