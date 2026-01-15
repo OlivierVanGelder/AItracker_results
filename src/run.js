@@ -27,7 +27,11 @@ async function main() {
   ensureDir(debugDir);
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ acceptDownloads: true });
+  const context = await browser.newContext({
+    acceptDownloads: true,
+    viewport: { width: 1400, height: 900 }
+});
+
   const page = await context.newPage();
 
   try {
@@ -59,18 +63,22 @@ async function main() {
 
     // Let op: er zijn 2 knoppen met "EXPORTEREN". We willen die in de modal.
     // Daarom zoeken we vanaf de titel naar een knop "EXPORTEREN" die NA de titel voorkomt.
+    // Zorg dat je deze selector gebruikt voor de knop in de modal
     const modalExportBtn = page
-      .locator("text=Exporteren")
-      .first()
-      .locator("xpath=following::button[normalize-space()='EXPORTEREN'][1]");
+    .locator("text=Exporteren")
+    .first()
+    .locator("xpath=following::button[normalize-space()='EXPORTEREN'][1]");
 
-    await modalExportBtn.click();
-
-    const download = await downloadPromise;
+    // Klik en wacht op download in één Promise.all
+    const [download] = await Promise.all([
+    context.waitForEvent("download", { timeout: exportTimeoutMs }),
+    modalExportBtn.click()
+    ]);
 
     const suggestedName = download.suggestedFilename();
     const filePath = path.join(downloadsDir, suggestedName);
     await download.saveAs(filePath);
+
 
     const result = await uploadFile({
       webhookUrl,
