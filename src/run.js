@@ -68,7 +68,7 @@ async function postToWebhook(webhookUrl, filePath) {
 }
 
 async function main() {
-  const GUEST_URL = process.env.GUEST_URL;
+  const GUEST_URL = process.env.SE_RANKING_GUEST_URL;
   if (!GUEST_URL) throw new Error("Zet env var GUEST_URL");
 
   const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
