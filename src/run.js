@@ -32,7 +32,6 @@ async function writeDebugArtifacts(page) {
 function filenameFromContentDisposition(cd) {
   if (!cd) return null;
 
-  // filename*=UTF-8''... of filename="..."
   const m1 = cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
   if (m1 && m1[1]) {
     try {
@@ -55,6 +54,23 @@ function extFromContentType(ct, preferredFormat) {
   if (t.includes("application/vnd.ms-excel")) return "xls";
   if (preferredFormat === "CSV") return "csv";
   return "xlsx";
+}
+
+async function fetchBinaryViaRequest(context, url, timeoutMs) {
+  // context.request gebruikt dezelfde browsercontext (cookies, auth state)
+  const res = await context.request.get(url, {
+    timeout: timeoutMs,
+    maxRedirects: 10
+  });
+
+  if (!res.ok()) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`context.request.get failed: ${res.status()} ${res.statusText()} url=${url} body=${txt.slice(0, 500)}`);
+  }
+
+  const headers = res.headers();
+  const buffer = await res.body();
+  return { headers, buffer };
 }
 
 async function main() {
@@ -87,7 +103,7 @@ async function main() {
     await page.goto(guestUrl, { waitUntil: "domcontentloaded", timeout: exportTimeoutMs });
     await page.waitForTimeout(1500);
 
-    // 1) Eerste export knop: button met material icon file_upload
+    // 1) Eerste export knop: file_upload icon
     const topExportBtn = page
       .locator("button:visible")
       .filter({ has: page.locator("i.material-icons:has-text('file_upload')") })
@@ -96,7 +112,7 @@ async function main() {
     await topExportBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
     await topExportBtn.click();
 
-    // 2) Export popup: format sectie
+    // 2) Export popup
     const formatRoot = page.locator(".export-format-buttons").first();
     await formatRoot.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
@@ -111,7 +127,7 @@ async function main() {
       await xlsxLabel.click();
     }
 
-    // 3) Vind popup container met footerknoppen en klik de primaire knop (laatste se-button-2)
+    // 3) Klik primaire knop (laatste se-button-2 in popup container)
     const popupContainer = formatRoot.locator(
       "xpath=ancestor::*[.//div[contains(@class,'export-format-buttons')] and .//button[contains(@class,'se-button-2')]][1]"
     );
@@ -120,40 +136,31 @@ async function main() {
 
     const actionButtons = popupContainer.locator("button.se-button-2:visible");
     const btnCount = await actionButtons.count();
-
-    if (btnCount === 0) {
-      throw new Error("Geen actieknoppen gevonden in de export popup container.");
-    }
+    if (btnCount === 0) throw new Error("Geen actieknoppen gevonden in de export popup container.");
 
     const finalBtn = actionButtons.nth(btnCount - 1);
     await finalBtn.waitFor({ state: "visible", timeout: exportTimeoutMs });
 
-    // 4) Wacht op download event of op een response die een attachment lijkt
-    // Download event (klassiek)
+    // 4) Wacht op download of op een export response URL
     const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs }).catch(() => null);
 
-    // Attachment response (API download)
     const responseWait = page
       .waitForResponse(
         async (res) => {
           try {
+            const url = res.url().toLowerCase();
+            if (!(url.includes("export") || url.includes("download") || url.includes("file"))) return false;
+
             const headers = await res.allHeaders();
             const cd = headers["content-disposition"] || headers["Content-Disposition"];
             const ct = headers["content-type"] || headers["Content-Type"];
 
             if (cd && /attachment/i.test(cd)) return true;
 
-            // Soms geen attachment header maar wel een excel/csv content type op export endpoint
-            const url = res.url().toLowerCase();
-            const looksLikeExportUrl =
-              url.includes("export") || url.includes("download") || url.includes("file");
-
-            const looksLikeFileType =
-              (ct || "").toLowerCase().includes("text/csv") ||
-              (ct || "").toLowerCase().includes("spreadsheetml") ||
-              (ct || "").toLowerCase().includes("application/vnd.ms-excel");
-
-            if (looksLikeExportUrl && looksLikeFileType) return true;
+            const ctLower = (ct || "").toLowerCase();
+            if (ctLower.includes("text/csv") || ctLower.includes("spreadsheetml") || ctLower.includes("application/vnd.ms-excel")) {
+              return true;
+            }
 
             return false;
           } catch {
@@ -164,10 +171,8 @@ async function main() {
       )
       .catch(() => null);
 
-    // Klik export (force omdat er soms overlays zijn)
     await finalBtn.click({ timeout: exportTimeoutMs, force: true });
 
-    // Race: download of response
     const winner = await Promise.race([
       downloadWait.then((d) => ({ kind: "download", value: d })),
       responseWait.then((r) => ({ kind: "response", value: r })),
@@ -200,21 +205,29 @@ async function main() {
 
     if (winner.kind === "response" && winner.value) {
       const res = winner.value;
-      const headers = await res.allHeaders();
-      const cd = headers["content-disposition"] || headers["Content-Disposition"];
-      const ct = headers["content-type"] || headers["Content-Type"];
 
-      const ext = extFromContentType(ct, preferredFormat);
-      const nameFromHeader = filenameFromContentDisposition(cd);
+      // Probeer metadata uit de originele response te halen
+      const originalHeaders = await res.allHeaders().catch(() => ({}));
+      const cd = originalHeaders["content-disposition"] || originalHeaders["Content-Disposition"];
+      const ct = originalHeaders["content-type"] || originalHeaders["Content-Type"];
+
+      const url = res.url();
+
+      // Body ophalen via context.request (stabieler dan response.body())
+      const fetched = await fetchBinaryViaRequest(context, url, exportTimeoutMs);
+      const fetchedCd = fetched.headers["content-disposition"] || fetched.headers["Content-Disposition"] || cd;
+      const fetchedCt = fetched.headers["content-type"] || fetched.headers["Content-Type"] || ct;
+
+      const ext = extFromContentType(fetchedCt, preferredFormat);
+      const nameFromHeader = filenameFromContentDisposition(fetchedCd);
       const suggestedName = nameFromHeader || `export.${ext}`;
 
-      const body = await res.body();
-      if (!body || body.length === 0) {
-        throw new Error("Export response ontvangen, maar body is leeg.");
+      if (!fetched.buffer || fetched.buffer.length === 0) {
+        throw new Error("Export fetch via context.request gaf een lege body.");
       }
 
       const filePath = path.join(downloadsDir, suggestedName);
-      fs.writeFileSync(filePath, body);
+      fs.writeFileSync(filePath, fetched.buffer);
 
       const result = await uploadFile({
         webhookUrl,
@@ -223,16 +236,16 @@ async function main() {
           source: "se-ranking-ai-search-guest-export",
           filename: suggestedName,
           format: preferredFormat,
-          method: "attachment-response"
+          method: "request-get"
         }
       });
 
-      console.log("Export saved from response:", filePath);
+      console.log("Export saved via context.request:", filePath);
       console.log("Webhook response:", result || "(empty)");
       return;
     }
 
-    throw new Error("Geen download event en geen attachment response gezien na export klik.");
+    throw new Error("Geen download event en geen bruikbare export response gezien na export klik.");
   } catch (err) {
     console.error(err);
     await writeDebugArtifacts(page);
