@@ -33,3 +33,10 @@ jobs:
           EXPORT_FORMAT: ${{ secrets.EXPORT_FORMAT }}
           EXPORT_TIMEOUT_MS: "120000"
         run: npm start
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+            name: debug
+            path: debug
+
