@@ -196,6 +196,20 @@ async function main() {
     const downloadWait = context.waitForEvent("download", { timeout: exportTimeoutMs }).catch(() => null);
 
     await finalBtn.click({ timeout: exportTimeoutMs, force: true });
+    // Na de laatste klik: wacht op "export bezig" popup en dat hij weer verdwijnt
+    const exportingDialog = page.locator("text=Exporteren van bestand is bezig").first();
+
+    // soms komt hij niet altijd, dus: try wachten op zichtbaar, maar fail niet hard
+    await exportingDialog.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+
+    // nu wachten tot hij weg is (export klaar)
+    await exportingDialog.waitFor({ state: "hidden", timeout: exportTimeoutMs }).catch(() => {
+    // Als hij blijft hangen, maken we debug, maar we gooien nog niet direct
+    });
+
+    // Extra buffer voor het moment dat de download pas ná het sluiten start
+    await page.waitForTimeout(2000);
+
 
     // Poll op fileCandidate, omdat responses async binnenkomen
     const started = Date.now();
