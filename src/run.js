@@ -1,13 +1,18 @@
 // src/run.js
 // ES module versie (package.json heeft "type": "module")
 //
-// Env vars:
-//   SE_RANKING_GUEST_URL  = volledige gastenlink naar de rankings pagina
-//   WEBHOOK_URL           = webhook waar je het csv bestand heen post (optioneel)
-//   DOWNLOAD_DIR          = map voor download (default: ./downloads)
-//   HEADLESS              = "true" of "false" (default: true)
-//   EXPORT_TIMEOUT_MS     = timeout voor export (default: 600000)
-//   DEBUG                 = "true" of "false" (default: true)
+// Gebruik:
+//   node src/run.js --guestUrl "https://..." --project "TMC" --company "The Member Company"
+//
+// Env vars (fallback):
+//   SE_RANKING_GUEST_URL
+//   PROJECT_NAME
+//   COMPANY_NAME
+//   WEBHOOK_URL
+//   DOWNLOAD_DIR
+//   HEADLESS
+//   EXPORT_TIMEOUT_MS
+//   DEBUG
 
 import fs from "node:fs";
 import path from "node:path";
@@ -43,15 +48,48 @@ function pickCsvFilenameFromHeaders(headers) {
   return m[1].replace(/(^"|"$)/g, "").trim();
 }
 
-async function postToWebhook(webhookUrl, filePath) {
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (!next || next.startsWith("--")) {
+      args[key] = "true";
+    } else {
+      args[key] = next;
+      i++;
+    }
+  }
+  return args;
+}
+
+function buildWebhookUrl(baseUrl, meta) {
+  // Zet project/company als query params, zodat je ze altijd terugziet in n8n webhook node
+  // In n8n komt dit binnen als $json.query.project enz.
+  const u = new URL(baseUrl);
+  if (meta.project) u.searchParams.set("project", meta.project);
+  if (meta.company) u.searchParams.set("company", meta.company);
+  if (meta.guestUrl) u.searchParams.set("guestUrl", meta.guestUrl);
+  return u.toString();
+}
+
+async function postToWebhook(webhookUrl, filePath, meta) {
   const data = await fs.promises.readFile(filePath);
   const filename = path.basename(filePath);
 
-  const res = await fetch(webhookUrl, {
+  const finalUrl = buildWebhookUrl(webhookUrl, meta);
+
+  const res = await fetch(finalUrl, {
     method: "POST",
     headers: {
       "content-type": "text/csv",
       "x-filename": filename,
+      // Extra zekerheid: ook in headers meesturen
+      "x-project": meta.project || "",
+      "x-company": meta.company || "",
+      "x-guest-url": meta.guestUrl || "",
     },
     body: data,
   });
@@ -64,17 +102,27 @@ async function postToWebhook(webhookUrl, filePath) {
 }
 
 async function main() {
-  const GUEST_URL = process.env.SE_RANKING_GUEST_URL;
+  const args = parseArgs(process.argv.slice(2));
+
+  // Guest url kan nu uit CLI argument komen, met env als fallback
+  const GUEST_URL = args.guestUrl || args.guesturl || process.env.SE_RANKING_GUEST_URL;
   if (!GUEST_URL) {
-    console.error("SE_RANKING_GUEST_URL ontbreekt");
+    console.error('SE_RANKING_GUEST_URL ontbreekt en er is geen --guestUrl meegegeven');
     process.exit(1);
   }
 
-  const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-  const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), "downloads");
-  const DEBUG = (process.env.DEBUG || "true").toLowerCase() === "true";
-  const HEADLESS = (process.env.HEADLESS || "true").toLowerCase() === "true";
-  const EXPORT_TIMEOUT_MS = Number(process.env.EXPORT_TIMEOUT_MS || "600000");
+  // Project of company kan uit CLI argument komen, met env als fallback
+  const meta = {
+    project: args.project || process.env.PROJECT_NAME || "",
+    company: args.company || process.env.COMPANY_NAME || "",
+    guestUrl: GUEST_URL,
+  };
+
+  const WEBHOOK_URL = args.webhookUrl || args.webhookurl || process.env.WEBHOOK_URL || "";
+  const DOWNLOAD_DIR = args.downloadDir || args.downloaddir || process.env.DOWNLOAD_DIR || path.join(process.cwd(), "downloads");
+  const DEBUG = String(args.debug || process.env.DEBUG || "true").toLowerCase() === "true";
+  const HEADLESS = String(args.headless || process.env.HEADLESS || "true").toLowerCase() === "true";
+  const EXPORT_TIMEOUT_MS = Number(args.exportTimeoutMs || args.exporttimeoutms || process.env.EXPORT_TIMEOUT_MS || "600000");
 
   const debugDir = path.join(process.cwd(), "debug");
   await ensureDir(DOWNLOAD_DIR);
@@ -103,7 +151,6 @@ async function main() {
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(1500);
 
-    // 1) Bovenste Exporteren knop (dropdown)
     const topExportBtn = page
       .locator("button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -113,10 +160,8 @@ async function main() {
     await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
     await topExportBtn.click();
 
-    // 2) Popup zichtbaar
     await page.locator("text=Exporteren").first().waitFor({ state: "visible", timeout: 120000 });
 
-    // 3) CSV tegel selecteren
     const csvTile = page
       .locator(".export-format-buttons__btn", {
         has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
@@ -126,7 +171,6 @@ async function main() {
     await csvTile.waitFor({ state: "visible", timeout: 120000 });
     await csvTile.click();
 
-    // 4) Exporteren knop in popup footer
     const footerExportBtn = page
       .locator(".export-popup-wrapper__footer button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -135,14 +179,7 @@ async function main() {
 
     await footerExportBtn.waitFor({ state: "visible", timeout: 120000 });
 
-    // 5) NIEUWE ROBUUSTE DOWNLOAD LOGICA
-    // Eerst proberen via Playwright download event.
-    // Als dat niet komt, dan via de do=download response body.
-    // Belangrijk: GEEN refetch, want token kan single use zijn.
-
-    const downloadPromise = page
-      .waitForEvent("download", { timeout: EXPORT_TIMEOUT_MS })
-      .catch(() => null);
+    const downloadPromise = page.waitForEvent("download", { timeout: EXPORT_TIMEOUT_MS }).catch(() => null);
 
     const csvResponsePromise = page
       .waitForResponse(
@@ -182,16 +219,16 @@ async function main() {
 
       const buf = await resp.body().catch(() => Buffer.from(""));
       if (!buf || buf.length === 0) {
-        throw new Error("CSV response gevonden maar body is leeg. Waarschijnlijk streamt de browser download, gebruik download event of verhoog timeout.");
+        throw new Error("CSV response gevonden maar body is leeg.");
       }
 
       await fs.promises.writeFile(outPath, buf);
       console.log("CSV via response body opgeslagen:", outPath, "bytes:", buf.length);
     }
 
-    // 6) Upload naar webhook (optioneel)
+    // Upload naar webhook
     if (WEBHOOK_URL) {
-      await postToWebhook(WEBHOOK_URL, outPath);
+      await postToWebhook(WEBHOOK_URL, outPath, meta);
     } else {
       console.log("WEBHOOK_URL niet gezet, alleen lokaal opgeslagen.");
     }
@@ -200,7 +237,9 @@ async function main() {
     await browser.close();
   } catch (err) {
     console.log("Fatal:", err?.message || err);
-    await saveDebugArtifacts(page, path.join(process.cwd(), "debug"), "fail");
+    if (DEBUG) {
+      await saveDebugArtifacts(page, path.join(process.cwd(), "debug"), "fail");
+    }
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
     process.exit(1);
