@@ -1,18 +1,22 @@
 // src/run.js
 // ES module versie (package.json heeft "type": "module")
 //
-// Gebruik:
-//   node src/run.js --guestUrl "https://..." --project "TMC" --company "The Member Company"
+// Doel:
+// - Open SE Ranking guest URL
+// - Exporteer CSV
+// - Lees projectnaam van de pagina
+// - Post CSV naar webhook met projectnaam en guestUrl als query params en headers
 //
-// Env vars (fallback):
-//   SE_RANKING_GUEST_URL
-//   PROJECT_NAME
-//   COMPANY_NAME
+// Input:
+// - CLI argument: --guestUrl "https://..."
+// - Fallback env: SE_RANKING_GUEST_URL
+//
+// Env vars:
 //   WEBHOOK_URL
-//   DOWNLOAD_DIR
-//   HEADLESS
-//   EXPORT_TIMEOUT_MS
-//   DEBUG
+//   DOWNLOAD_DIR          (default: ./downloads)
+//   HEADLESS              ("true" of "false", default: true)
+//   EXPORT_TIMEOUT_MS     (default: 600000)
+//   DEBUG                 ("true" of "false", default: true)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -65,12 +69,46 @@ function parseArgs(argv) {
   return args;
 }
 
+function cleanText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+async function scrapeProjectName(page) {
+  // Robust: probeer meerdere plekken waar SE Ranking projectnaam vaak staat.
+  // Als geen match, fallback op title.
+  const selectors = [
+    '[data-testid="project-name"]',
+    '[data-testid="projectTitle"]',
+    ".project-switcher__value",
+    ".se-project-switcher__value",
+    ".header__project-name",
+    ".breadcrumbs__item:last-child",
+    ".breadcrumbs li:last-child",
+    ".page-title",
+    "h1",
+  ];
+
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      const count = await loc.count().catch(() => 0);
+      if (!count) continue;
+
+      let txt = "";
+      txt = (await loc.innerText().catch(() => "")) || "";
+      txt = cleanText(txt);
+
+      if (txt && txt.length >= 2 && txt.length <= 140) return txt;
+    } catch {}
+  }
+
+  const title = cleanText(await page.title().catch(() => ""));
+  return title && title.length <= 200 ? title : "";
+}
+
 function buildWebhookUrl(baseUrl, meta) {
-  // Zet project/company als query params, zodat je ze altijd terugziet in n8n webhook node
-  // In n8n komt dit binnen als $json.query.project enz.
   const u = new URL(baseUrl);
   if (meta.project) u.searchParams.set("project", meta.project);
-  if (meta.company) u.searchParams.set("company", meta.company);
   if (meta.guestUrl) u.searchParams.set("guestUrl", meta.guestUrl);
   return u.toString();
 }
@@ -86,9 +124,7 @@ async function postToWebhook(webhookUrl, filePath, meta) {
     headers: {
       "content-type": "text/csv",
       "x-filename": filename,
-      // Extra zekerheid: ook in headers meesturen
       "x-project": meta.project || "",
-      "x-company": meta.company || "",
       "x-guest-url": meta.guestUrl || "",
     },
     body: data,
@@ -104,25 +140,17 @@ async function postToWebhook(webhookUrl, filePath, meta) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  // Guest url kan nu uit CLI argument komen, met env als fallback
   const GUEST_URL = args.guestUrl || args.guesturl || process.env.SE_RANKING_GUEST_URL;
   if (!GUEST_URL) {
-    console.error('SE_RANKING_GUEST_URL ontbreekt en er is geen --guestUrl meegegeven');
+    console.error('Geen guest URL. Geef --guestUrl mee of zet SE_RANKING_GUEST_URL.');
     process.exit(1);
   }
 
-  // Project of company kan uit CLI argument komen, met env als fallback
-  const meta = {
-    project: args.project || process.env.PROJECT_NAME || "",
-    company: args.company || process.env.COMPANY_NAME || "",
-    guestUrl: GUEST_URL,
-  };
-
-  const WEBHOOK_URL = args.webhookUrl || args.webhookurl || process.env.WEBHOOK_URL || "";
-  const DOWNLOAD_DIR = args.downloadDir || args.downloaddir || process.env.DOWNLOAD_DIR || path.join(process.cwd(), "downloads");
-  const DEBUG = String(args.debug || process.env.DEBUG || "true").toLowerCase() === "true";
-  const HEADLESS = String(args.headless || process.env.HEADLESS || "true").toLowerCase() === "true";
-  const EXPORT_TIMEOUT_MS = Number(args.exportTimeoutMs || args.exporttimeoutms || process.env.EXPORT_TIMEOUT_MS || "600000");
+  const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+  const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), "downloads");
+  const DEBUG = (process.env.DEBUG || "true").toLowerCase() === "true";
+  const HEADLESS = (process.env.HEADLESS || "true").toLowerCase() === "true";
+  const EXPORT_TIMEOUT_MS = Number(process.env.EXPORT_TIMEOUT_MS || "600000");
 
   const debugDir = path.join(process.cwd(), "debug");
   await ensureDir(DOWNLOAD_DIR);
@@ -149,8 +177,17 @@ async function main() {
   try {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
 
+    const projectName = await scrapeProjectName(page);
+    console.log("Projectnaam:", projectName || "(niet gevonden)");
+
+    const meta = {
+      project: projectName || "",
+      guestUrl: GUEST_URL,
+    };
+
+    // 1) Bovenste Exporteren knop (dropdown)
     const topExportBtn = page
       .locator("button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -160,8 +197,10 @@ async function main() {
     await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
     await topExportBtn.click();
 
+    // 2) Popup zichtbaar
     await page.locator("text=Exporteren").first().waitFor({ state: "visible", timeout: 120000 });
 
+    // 3) CSV tegel selecteren
     const csvTile = page
       .locator(".export-format-buttons__btn", {
         has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
@@ -171,6 +210,7 @@ async function main() {
     await csvTile.waitFor({ state: "visible", timeout: 120000 });
     await csvTile.click();
 
+    // 4) Exporteren knop in popup footer
     const footerExportBtn = page
       .locator(".export-popup-wrapper__footer button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -179,6 +219,7 @@ async function main() {
 
     await footerExportBtn.waitFor({ state: "visible", timeout: 120000 });
 
+    // 5) Download via download event, fallback via response
     const downloadPromise = page.waitForEvent("download", { timeout: EXPORT_TIMEOUT_MS }).catch(() => null);
 
     const csvResponsePromise = page
@@ -209,7 +250,7 @@ async function main() {
     } else {
       const resp = await csvResponsePromise;
       if (!resp) {
-        throw new Error("Geen download event en geen CSV response gezien. Mogelijk is export nog bezig of UI blokkeert.");
+        throw new Error("Geen download event en geen CSV response gezien.");
       }
 
       const headers = resp.headers();
@@ -226,7 +267,7 @@ async function main() {
       console.log("CSV via response body opgeslagen:", outPath, "bytes:", buf.length);
     }
 
-    // Upload naar webhook
+    // 6) Upload naar webhook
     if (WEBHOOK_URL) {
       await postToWebhook(WEBHOOK_URL, outPath, meta);
     } else {
@@ -238,7 +279,7 @@ async function main() {
   } catch (err) {
     console.log("Fatal:", err?.message || err);
     if (DEBUG) {
-      await saveDebugArtifacts(page, path.join(process.cwd(), "debug"), "fail");
+      await saveDebugArtifacts(page, debugDir, "fail");
     }
     await context.close().catch(() => {});
     await browser.close().catch(() => {});

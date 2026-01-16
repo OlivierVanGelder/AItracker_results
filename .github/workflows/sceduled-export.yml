@@ -8,16 +8,6 @@ on:
         required: false
         type: string
 
-      project:
-        description: Projectnaam
-        required: false
-        type: string
-
-      company:
-        description: Bedrijfsnaam
-        required: false
-        type: string
-
   schedule:
     - cron: "0 7 * * 1,3,5"
 
@@ -48,9 +38,7 @@ jobs:
           EXPORT_TIMEOUT_MS: "120000"
         run: |
           node src/run.js \
-            ${{ inputs.guestUrl && format('--guestUrl "{0}"', inputs.guestUrl) || '' }} \
-            ${{ inputs.project && format('--project "{0}"', inputs.project) || '' }} \
-            ${{ inputs.company && format('--company "{0}"', inputs.company) || '' }}
+            ${{ inputs.guestUrl && format('--guestUrl "{0}"', inputs.guestUrl) || '' }}
 
       - name: Upload debug artifacts
         if: always()
