@@ -1,11 +1,8 @@
 // src/run.js
 // ES module versie (package.json heeft "type": "module")
 //
-// Doel:
-// - Open SE Ranking guest URL
-// - Exporteer CSV
-// - Lees projectnaam van de pagina
-// - Post CSV naar webhook met projectnaam en guestUrl als query params en headers
+// Projectnaam ophalen via breadcrumb link zoals:
+// <a class="se-breadcrumbs__link">themembercompany.com</a>
 //
 // Input:
 // - CLI argument: --guestUrl "https://..."
@@ -74,34 +71,27 @@ function cleanText(s) {
 }
 
 async function scrapeProjectName(page) {
-  // Robust: probeer meerdere plekken waar SE Ranking projectnaam vaak staat.
-  // Als geen match, fallback op title.
-  const selectors = [
-    '[data-testid="project-name"]',
-    '[data-testid="projectTitle"]',
-    ".project-switcher__value",
-    ".se-project-switcher__value",
-    ".header__project-name",
-    ".breadcrumbs__item:last-child",
-    ".breadcrumbs li:last-child",
-    ".page-title",
-    "h1",
-  ];
+  // 1) Wacht op breadcrumb links en pak de eerste als projectnaam
+  // Voorbeeld: <a class="se-breadcrumbs__link">themembercompany.com</a>
+  try {
+    const breadcrumbLink = page.locator("a.se-breadcrumbs__link").first();
+    await breadcrumbLink.waitFor({ state: "visible", timeout: 30000 });
 
-  for (const sel of selectors) {
-    try {
-      const loc = page.locator(sel).first();
-      const count = await loc.count().catch(() => 0);
-      if (!count) continue;
+    const txt = cleanText(await breadcrumbLink.innerText().catch(() => ""));
+    if (txt && txt.length >= 2 && txt.length <= 140) return txt;
+  } catch {}
 
-      let txt = "";
-      txt = (await loc.innerText().catch(() => "")) || "";
-      txt = cleanText(txt);
-
+  // 2) Fallback: pak de laatste breadcrumb link als eerste leeg is
+  try {
+    const lastBreadcrumb = page.locator("a.se-breadcrumbs__link").last();
+    const count = await lastBreadcrumb.count().catch(() => 0);
+    if (count) {
+      const txt = cleanText(await lastBreadcrumb.innerText().catch(() => ""));
       if (txt && txt.length >= 2 && txt.length <= 140) return txt;
-    } catch {}
-  }
+    }
+  } catch {}
 
+  // 3) Extra fallback: title
   const title = cleanText(await page.title().catch(() => ""));
   return title && title.length <= 200 ? title : "";
 }
@@ -177,7 +167,9 @@ async function main() {
   try {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
-    await page.waitForTimeout(2000);
+
+    // Wacht kort zodat SPA en breadcrumbs kunnen renderen
+    await page.waitForTimeout(2500);
 
     const projectName = await scrapeProjectName(page);
     console.log("Projectnaam:", projectName || "(niet gevonden)");
