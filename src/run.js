@@ -182,20 +182,18 @@ async function selectCsvInPopup(popup) {
 
 
 async function clickExportInPopup(popup) {
-  // Primair: pak de knop "Exporteren" binnen de footer van de popup
-  const btn = popup
-    .locator(".export-popup-wrapper__footer button", {
-      has: popup.locator(".se-button-2__text", { hasText: "Exporteren" }),
-    })
-    .last();
+  // Zoek binnen de popup naar knoppen met tekst Exporteren
+  // In de popup is dat meestal precies 1 knop, maar we pakken bewust de laatste match
+  const exportBtn = popup.locator("button", { hasText: "Exporteren" }).last();
 
-  // Wacht op "attached" (staat in DOM), niet op visible
-  await btn.waitFor({ state: "attached", timeout: 30000 });
+  // Wacht alleen tot hij in de DOM hangt
+  await exportBtn.waitFor({ state: "attached", timeout: 30000 });
 
-  // Zorg dat hij in beeld is en klik geforceerd
-  await btn.scrollIntoViewIfNeeded().catch(() => {});
-  await btn.click({ force: true, timeout: 30000 });
+  // Zorg dat hij klikbaar is
+  await exportBtn.scrollIntoViewIfNeeded().catch(() => {});
+  await exportBtn.click({ force: true, timeout: 30000 });
 }
+
 
 
 async function main() {
