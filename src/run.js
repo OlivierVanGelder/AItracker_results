@@ -1,8 +1,13 @@
 // src/run.js
 // ES module versie (package.json heeft "type": "module")
 //
-// Projectnaam ophalen via breadcrumb link zoals:
-// <a class="se-breadcrumbs__link">themembercompany.com</a>
+// Doel:
+// - Open SE Ranking guest URL
+// - Projectnaam ophalen via breadcrumb link: a.se-breadcrumbs__link
+// - Export popup openen
+// - In export popup "Alle zoekmachines" selecteren
+// - CSV exporteren
+// - Post CSV naar webhook met project en guestUrl als query params en headers
 //
 // Input:
 // - CLI argument: --guestUrl "https://..."
@@ -71,17 +76,13 @@ function cleanText(s) {
 }
 
 async function scrapeProjectName(page) {
-  // 1) Wacht op breadcrumb links en pak de eerste als projectnaam
-  // Voorbeeld: <a class="se-breadcrumbs__link">themembercompany.com</a>
   try {
     const breadcrumbLink = page.locator("a.se-breadcrumbs__link").first();
     await breadcrumbLink.waitFor({ state: "visible", timeout: 30000 });
-
     const txt = cleanText(await breadcrumbLink.innerText().catch(() => ""));
     if (txt && txt.length >= 2 && txt.length <= 140) return txt;
   } catch {}
 
-  // 2) Fallback: pak de laatste breadcrumb link als eerste leeg is
   try {
     const lastBreadcrumb = page.locator("a.se-breadcrumbs__link").last();
     const count = await lastBreadcrumb.count().catch(() => 0);
@@ -91,7 +92,6 @@ async function scrapeProjectName(page) {
     }
   } catch {}
 
-  // 3) Extra fallback: title
   const title = cleanText(await page.title().catch(() => ""));
   return title && title.length <= 200 ? title : "";
 }
@@ -127,12 +127,45 @@ async function postToWebhook(webhookUrl, filePath, meta) {
   console.log("Webhook OK:", res.status);
 }
 
+async function selectAllEnginesInExportPopup(page) {
+  // We werken binnen de export popup om misclicks te voorkomen
+  const popup = page.locator(".export-popup-wrapper").first();
+  await popup.waitFor({ state: "visible", timeout: 60000 });
+
+  // Open de zoekmachine dropdown (button wrapper)
+  // Dit is robuust: we klikken de button binnen de engines dropdown container
+  const dropdownButton = popup.locator(".engines-dropdown .se-button-2__wrapper").first();
+
+  // Sommige builds hebben een iets andere structuur, daarom fallback
+  const dropdownFallback = popup.locator(".engines-dropdown").first();
+
+  if ((await dropdownButton.count().catch(() => 0)) > 0) {
+    await dropdownButton.click({ timeout: 30000 });
+  } else {
+    await dropdownFallback.click({ timeout: 30000 });
+  }
+
+  // Wacht tot de lijst zichtbaar is en klik "Alle zoekmachines"
+  // De tekst komt in jouw screenshot terug als: <span>Alle zoekmachines</span>
+  const allEnginesItem = page
+    .locator(".engines-dropdown__item", {
+      has: page.locator("text=Alle zoekmachines"),
+    })
+    .first();
+
+  await allEnginesItem.waitFor({ state: "visible", timeout: 30000 });
+  await allEnginesItem.click();
+
+  // Kleine pauze zodat de keuze wordt toegepast
+  await page.waitForTimeout(300);
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   const GUEST_URL = args.guestUrl || args.guesturl || process.env.SE_RANKING_GUEST_URL;
   if (!GUEST_URL) {
-    console.error('Geen guest URL. Geef --guestUrl mee of zet SE_RANKING_GUEST_URL.');
+    console.error("Geen guest URL. Geef --guestUrl mee of zet SE_RANKING_GUEST_URL.");
     process.exit(1);
   }
 
@@ -167,8 +200,6 @@ async function main() {
   try {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
-
-    // Wacht kort zodat SPA en breadcrumbs kunnen renderen
     await page.waitForTimeout(2500);
 
     const projectName = await scrapeProjectName(page);
@@ -179,7 +210,7 @@ async function main() {
       guestUrl: GUEST_URL,
     };
 
-    // 1) Bovenste Exporteren knop (dropdown)
+    // 1) Bovenste Exporteren knop
     const topExportBtn = page
       .locator("button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -191,6 +222,9 @@ async function main() {
 
     // 2) Popup zichtbaar
     await page.locator("text=Exporteren").first().waitFor({ state: "visible", timeout: 120000 });
+
+    // 2a) Selecteer "Alle zoekmachines" zodat je alle resultaten krijgt
+    await selectAllEnginesInExportPopup(page);
 
     // 3) CSV tegel selecteren
     const csvTile = page
