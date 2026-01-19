@@ -1,4 +1,14 @@
 // src/run.js
+// ES module versie (package.json heeft "type": "module")
+//
+// Doel:
+// - Open SE Ranking guest URL
+// - Projectnaam ophalen via breadcrumb link: a.se-breadcrumbs__link
+// - Export popup openen (se-popup-window-2)
+// - Selecteer "Alle zoekmachines"
+// - Selecteer CSV
+// - Klik Exporteren
+// - Wacht op download en post naar webhook met project en guestUrl
 
 import fs from "node:fs";
 import path from "node:path";
@@ -99,8 +109,7 @@ async function postToWebhook(webhookUrl, filePath, meta) {
 }
 
 async function openExportPopup(page) {
-  // Klik op de export knop en wacht op een zichtbaar element binnen de popup.
-  // We gebruiken meerdere signalen, want ".export-popup-wrapper" kan hidden in DOM staan.
+  // Klik op de export knop die de dropdown opent
   const topExportBtn = page
     .locator("button:visible", {
       has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
@@ -108,50 +117,29 @@ async function openExportPopup(page) {
     .first();
 
   await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
+  await topExportBtn.click();
 
-  const popupVisibleTitle = page.locator(".export-popup-wrapper:visible text=Exporteren").first();
-  const popupFooter = page.locator(".export-popup-wrapper:visible .export-popup-wrapper__footer").first();
-  const popupAnyVisible = page.locator(".export-popup-wrapper:visible").first();
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    await topExportBtn.click().catch(() => {});
-    await page.waitForTimeout(400);
-
-    const ok =
-      (await popupVisibleTitle.isVisible().catch(() => false)) ||
-      (await popupFooter.isVisible().catch(() => false)) ||
-      (await popupAnyVisible.isVisible().catch(() => false));
-
-    if (ok) return;
-
-    // Soms zit er een overlay of focus issue, Escape helpt vaak
-    await page.keyboard.press("Escape").catch(() => {});
-    await page.waitForTimeout(250);
-  }
-
-  // Laatste poging: wacht kort, misschien animatie
-  await popupAnyVisible.waitFor({ state: "visible", timeout: 15000 });
-}
-
-async function selectAllEnginesInExportPopup(page) {
-  // Werk strikt binnen de zichtbare popup
-  const popup = page.locator(".export-popup-wrapper:visible").first();
+  // Wacht op de echte popup container
+  const popup = page.locator(".se-popup-window-2__box:visible").first();
   await popup.waitFor({ state: "visible", timeout: 60000 });
 
-  // Open dropdown
-  const dropdownButton = popup.locator(".engines-dropdown .se-button-2__wrapper").first();
-  const dropdownFallback = popup.locator(".engines-dropdown").first();
+  // Verifieer dat dit de export popup is
+  const title = popup.locator(".se-popup-window-2__title", { hasText: "Exporteren" }).first();
+  await title.waitFor({ state: "visible", timeout: 30000 });
 
-  if ((await dropdownButton.count().catch(() => 0)) > 0) {
-    await dropdownButton.click({ timeout: 30000 });
-  } else {
-    await dropdownFallback.click({ timeout: 30000 });
-  }
+  return popup;
+}
 
-  // Klik item "Alle zoekmachines"
+async function selectAllEnginesInPopup(page, popup) {
+  // Open dropdown (button staat in engines-dropdown)
+  const enginesBtn = popup.locator(".se-dropdown-slot.engines-dropdown button").first();
+  await enginesBtn.waitFor({ state: "visible", timeout: 30000 });
+  await enginesBtn.click();
+
+  // Klik "Alle zoekmachines"
   const allEnginesItem = page
-    .locator(".engines-dropdown__item:visible", {
-      has: page.locator("text=Alle zoekmachines"),
+    .locator(".engines-dropdown__item", {
+      has: page.locator(".engines-dropdown__item-text span", { hasText: "Alle zoekmachines" }),
     })
     .first();
 
@@ -159,6 +147,28 @@ async function selectAllEnginesInExportPopup(page) {
   await allEnginesItem.click();
 
   await page.waitForTimeout(300);
+}
+
+async function selectCsvInPopup(popup) {
+  const csvBtn = popup
+    .locator(".export-format-buttons__btn", {
+      has: popup.locator(".export-format-buttons__btn-label", { hasText: "CSV(.csv)" }),
+    })
+    .first();
+
+  await csvBtn.waitFor({ state: "visible", timeout: 30000 });
+  await csvBtn.click();
+}
+
+async function clickExportInPopup(popup) {
+  const exportBtn = popup
+    .locator("button.se-button-2_primary:visible", {
+      has: popup.locator(".se-button-2__text", { hasText: "Exporteren" }),
+    })
+    .first();
+
+  await exportBtn.waitFor({ state: "visible", timeout: 30000 });
+  await exportBtn.click();
 }
 
 async function main() {
@@ -208,31 +218,16 @@ async function main() {
 
     const meta = { project: projectName || "", guestUrl: GUEST_URL };
 
-    // Open export popup robuust
-    await openExportPopup(page);
+    // Popup openen
+    const popup = await openExportPopup(page);
 
-    // Selecteer "Alle zoekmachines"
-    await selectAllEnginesInExportPopup(page);
+    // Alle zoekmachines selecteren
+    await selectAllEnginesInPopup(page, popup);
 
-    // CSV tegel selecteren
-    const csvTile = page
-      .locator(".export-popup-wrapper:visible .export-format-buttons__btn", {
-        has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
-      })
-      .first();
+    // CSV selecteren
+    await selectCsvInPopup(popup);
 
-    await csvTile.waitFor({ state: "visible", timeout: 60000 });
-    await csvTile.click();
-
-    // Footer export knop
-    const footerExportBtn = page
-      .locator(".export-popup-wrapper:visible .export-popup-wrapper__footer button:visible", {
-        has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
-      })
-      .first();
-
-    await footerExportBtn.waitFor({ state: "visible", timeout: 60000 });
-
+    // Download wachtpunten klaarzetten vóór de export klik
     const downloadPromise = page.waitForEvent("download", { timeout: EXPORT_TIMEOUT_MS }).catch(() => null);
 
     const csvResponsePromise = page
@@ -249,8 +244,10 @@ async function main() {
       )
       .catch(() => null);
 
-    await footerExportBtn.click();
+    // Exporteren in popup
+    await clickExportInPopup(popup);
 
+    // Download opslaan
     let outPath = "";
     const dl = await downloadPromise;
 
@@ -280,6 +277,7 @@ async function main() {
       console.log("CSV via response body opgeslagen:", outPath, "bytes:", buf.length);
     }
 
+    // Upload
     if (WEBHOOK_URL) {
       await postToWebhook(WEBHOOK_URL, outPath, meta);
     } else {
