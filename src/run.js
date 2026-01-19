@@ -150,15 +150,29 @@ async function selectAllEnginesInPopup(page, popup) {
 }
 
 async function selectCsvInPopup(popup) {
-  const csvBtn = popup
+  // 1) Primair: label bevat "CSV" (niet exact matchen op CSV(.csv))
+  const csvByLabel = popup
     .locator(".export-format-buttons__btn", {
-      has: popup.locator(".export-format-buttons__btn-label", { hasText: "CSV(.csv)" }),
+      has: popup.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
     })
     .first();
 
-  await csvBtn.waitFor({ state: "visible", timeout: 30000 });
-  await csvBtn.click();
+  if (await csvByLabel.isVisible().catch(() => false)) {
+    await csvByLabel.click();
+    return;
+  }
+
+  // 2) Fallback: zoek op het csv icoon (background-image bevat 'csv-icn')
+  const csvByIcon = popup
+    .locator(".export-format-buttons__btn", {
+      has: popup.locator('.se-icon-2__body[style*="csv-icn"]'),
+    })
+    .first();
+
+  await csvByIcon.waitFor({ state: "visible", timeout: 30000 });
+  await csvByIcon.click();
 }
+
 
 async function clickExportInPopup(popup) {
   const exportBtn = popup
