@@ -150,28 +150,35 @@ async function selectAllEnginesInPopup(page, popup) {
 }
 
 async function selectCsvInPopup(popup) {
-  // 1) Primair: label bevat "CSV" (niet exact matchen op CSV(.csv))
-  const csvByLabel = popup
-    .locator(".export-format-buttons__btn", {
-      has: popup.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
-    })
-    .first();
+  // Als CSV al geselecteerd is: klaar
+  const already = popup.locator(
+    '.export-format-buttons__btn_selected .export-format-buttons__btn-label'
+  );
 
-  if (await csvByLabel.isVisible().catch(() => false)) {
-    await csvByLabel.click();
-    return;
+  if ((await already.count().catch(() => 0)) > 0) {
+    const t = (await already.first().innerText().catch(() => "")).trim();
+    if (t === "CSV(.csv)" || t.includes("CSV")) return;
   }
 
-  // 2) Fallback: zoek op het csv icoon (background-image bevat 'csv-icn')
-  const csvByIcon = popup
-    .locator(".export-format-buttons__btn", {
-      has: popup.locator('.se-icon-2__body[style*="csv-icn"]'),
-    })
-    .first();
+  // 1) Vind de label div die letterlijk "CSV(.csv)" bevat
+  const label = popup.locator(".export-format-buttons__btn-label").filter({
+    hasText: "CSV(.csv)",
+  });
 
-  await csvByIcon.waitFor({ state: "visible", timeout: 30000 });
-  await csvByIcon.click();
+  await label.first().waitFor({ state: "visible", timeout: 30000 });
+
+  // 2) Klik de parent tegel (de div export-format-buttons__btn)
+  const tile = label.first().locator("xpath=ancestor::div[contains(@class,'export-format-buttons__btn')][1]");
+  await tile.waitFor({ state: "visible", timeout: 30000 });
+  await tile.click({ force: true });
+
+  // 3) Verifieer selectie
+  await popup
+    .locator(".export-format-buttons__btn_selected .export-format-buttons__btn-label")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 });
 }
+
 
 
 async function clickExportInPopup(popup) {
