@@ -1,24 +1,4 @@
 // src/run.js
-// ES module versie (package.json heeft "type": "module")
-//
-// Doel:
-// - Open SE Ranking guest URL
-// - Projectnaam ophalen via breadcrumb link: a.se-breadcrumbs__link
-// - Export popup openen
-// - In export popup "Alle zoekmachines" selecteren
-// - CSV exporteren
-// - Post CSV naar webhook met project en guestUrl als query params en headers
-//
-// Input:
-// - CLI argument: --guestUrl "https://..."
-// - Fallback env: SE_RANKING_GUEST_URL
-//
-// Env vars:
-//   WEBHOOK_URL
-//   DOWNLOAD_DIR          (default: ./downloads)
-//   HEADLESS              ("true" of "false", default: true)
-//   EXPORT_TIMEOUT_MS     (default: 600000)
-//   DEBUG                 ("true" of "false", default: true)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -78,18 +58,9 @@ function cleanText(s) {
 async function scrapeProjectName(page) {
   try {
     const breadcrumbLink = page.locator("a.se-breadcrumbs__link").first();
-    await breadcrumbLink.waitFor({ state: "visible", timeout: 30000 });
+    await breadcrumbLink.waitFor({ state: "visible", timeout: 45000 });
     const txt = cleanText(await breadcrumbLink.innerText().catch(() => ""));
     if (txt && txt.length >= 2 && txt.length <= 140) return txt;
-  } catch {}
-
-  try {
-    const lastBreadcrumb = page.locator("a.se-breadcrumbs__link").last();
-    const count = await lastBreadcrumb.count().catch(() => 0);
-    if (count) {
-      const txt = cleanText(await lastBreadcrumb.innerText().catch(() => ""));
-      if (txt && txt.length >= 2 && txt.length <= 140) return txt;
-    }
   } catch {}
 
   const title = cleanText(await page.title().catch(() => ""));
@@ -127,16 +98,48 @@ async function postToWebhook(webhookUrl, filePath, meta) {
   console.log("Webhook OK:", res.status);
 }
 
+async function openExportPopup(page) {
+  // Klik op de export knop en wacht op een zichtbaar element binnen de popup.
+  // We gebruiken meerdere signalen, want ".export-popup-wrapper" kan hidden in DOM staan.
+  const topExportBtn = page
+    .locator("button:visible", {
+      has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
+    })
+    .first();
+
+  await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
+
+  const popupVisibleTitle = page.locator(".export-popup-wrapper:visible text=Exporteren").first();
+  const popupFooter = page.locator(".export-popup-wrapper:visible .export-popup-wrapper__footer").first();
+  const popupAnyVisible = page.locator(".export-popup-wrapper:visible").first();
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await topExportBtn.click().catch(() => {});
+    await page.waitForTimeout(400);
+
+    const ok =
+      (await popupVisibleTitle.isVisible().catch(() => false)) ||
+      (await popupFooter.isVisible().catch(() => false)) ||
+      (await popupAnyVisible.isVisible().catch(() => false));
+
+    if (ok) return;
+
+    // Soms zit er een overlay of focus issue, Escape helpt vaak
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(250);
+  }
+
+  // Laatste poging: wacht kort, misschien animatie
+  await popupAnyVisible.waitFor({ state: "visible", timeout: 15000 });
+}
+
 async function selectAllEnginesInExportPopup(page) {
-  // We werken binnen de export popup om misclicks te voorkomen
-  const popup = page.locator(".export-popup-wrapper").first();
+  // Werk strikt binnen de zichtbare popup
+  const popup = page.locator(".export-popup-wrapper:visible").first();
   await popup.waitFor({ state: "visible", timeout: 60000 });
 
-  // Open de zoekmachine dropdown (button wrapper)
-  // Dit is robuust: we klikken de button binnen de engines dropdown container
+  // Open dropdown
   const dropdownButton = popup.locator(".engines-dropdown .se-button-2__wrapper").first();
-
-  // Sommige builds hebben een iets andere structuur, daarom fallback
   const dropdownFallback = popup.locator(".engines-dropdown").first();
 
   if ((await dropdownButton.count().catch(() => 0)) > 0) {
@@ -145,10 +148,9 @@ async function selectAllEnginesInExportPopup(page) {
     await dropdownFallback.click({ timeout: 30000 });
   }
 
-  // Wacht tot de lijst zichtbaar is en klik "Alle zoekmachines"
-  // De tekst komt in jouw screenshot terug als: <span>Alle zoekmachines</span>
+  // Klik item "Alle zoekmachines"
   const allEnginesItem = page
-    .locator(".engines-dropdown__item", {
+    .locator(".engines-dropdown__item:visible", {
       has: page.locator("text=Alle zoekmachines"),
     })
     .first();
@@ -156,7 +158,6 @@ async function selectAllEnginesInExportPopup(page) {
   await allEnginesItem.waitFor({ state: "visible", timeout: 30000 });
   await allEnginesItem.click();
 
-  // Kleine pauze zodat de keuze wordt toegepast
   await page.waitForTimeout(300);
 }
 
@@ -205,47 +206,33 @@ async function main() {
     const projectName = await scrapeProjectName(page);
     console.log("Projectnaam:", projectName || "(niet gevonden)");
 
-    const meta = {
-      project: projectName || "",
-      guestUrl: GUEST_URL,
-    };
+    const meta = { project: projectName || "", guestUrl: GUEST_URL };
 
-    // 1) Bovenste Exporteren knop
-    const topExportBtn = page
-      .locator("button:visible", {
-        has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
-      })
-      .first();
+    // Open export popup robuust
+    await openExportPopup(page);
 
-    await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
-    await topExportBtn.click();
-
-    // 2) Popup zichtbaar
-    await page.locator("text=Exporteren").first().waitFor({ state: "visible", timeout: 120000 });
-
-    // 2a) Selecteer "Alle zoekmachines" zodat je alle resultaten krijgt
+    // Selecteer "Alle zoekmachines"
     await selectAllEnginesInExportPopup(page);
 
-    // 3) CSV tegel selecteren
+    // CSV tegel selecteren
     const csvTile = page
-      .locator(".export-format-buttons__btn", {
+      .locator(".export-popup-wrapper:visible .export-format-buttons__btn", {
         has: page.locator(".export-format-buttons__btn-label", { hasText: "CSV" }),
       })
       .first();
 
-    await csvTile.waitFor({ state: "visible", timeout: 120000 });
+    await csvTile.waitFor({ state: "visible", timeout: 60000 });
     await csvTile.click();
 
-    // 4) Exporteren knop in popup footer
+    // Footer export knop
     const footerExportBtn = page
-      .locator(".export-popup-wrapper__footer button:visible", {
+      .locator(".export-popup-wrapper:visible .export-popup-wrapper__footer button:visible", {
         has: page.locator(".se-button-2__text", { hasText: "Exporteren" }),
       })
       .first();
 
-    await footerExportBtn.waitFor({ state: "visible", timeout: 120000 });
+    await footerExportBtn.waitFor({ state: "visible", timeout: 60000 });
 
-    // 5) Download via download event, fallback via response
     const downloadPromise = page.waitForEvent("download", { timeout: EXPORT_TIMEOUT_MS }).catch(() => null);
 
     const csvResponsePromise = page
@@ -293,7 +280,6 @@ async function main() {
       console.log("CSV via response body opgeslagen:", outPath, "bytes:", buf.length);
     }
 
-    // 6) Upload naar webhook
     if (WEBHOOK_URL) {
       await postToWebhook(WEBHOOK_URL, outPath, meta);
     } else {
