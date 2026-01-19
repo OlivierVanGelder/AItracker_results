@@ -182,15 +182,21 @@ async function selectCsvInPopup(popup) {
 
 
 async function clickExportInPopup(popup) {
-  const exportBtn = popup
-    .locator("button.se-button-2_primary:visible", {
+  // Primair: pak de knop "Exporteren" binnen de footer van de popup
+  const btn = popup
+    .locator(".export-popup-wrapper__footer button", {
       has: popup.locator(".se-button-2__text", { hasText: "Exporteren" }),
     })
-    .first();
+    .last();
 
-  await exportBtn.waitFor({ state: "visible", timeout: 30000 });
-  await exportBtn.click();
+  // Wacht op "attached" (staat in DOM), niet op visible
+  await btn.waitFor({ state: "attached", timeout: 30000 });
+
+  // Zorg dat hij in beeld is en klik geforceerd
+  await btn.scrollIntoViewIfNeeded().catch(() => {});
+  await btn.click({ force: true, timeout: 30000 });
 }
+
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
