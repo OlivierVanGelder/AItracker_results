@@ -134,17 +134,39 @@ async function selectAllEnginesInPopup(page, popup) {
   // Open dropdown (button staat in engines-dropdown)
   const enginesBtn = popup.locator(".se-dropdown-slot.engines-dropdown button").first();
   await enginesBtn.waitFor({ state: "visible", timeout: 30000 });
-  await enginesBtn.click();
 
-  // Klik "Alle zoekmachines"
+  // Soms is er maar één optie en gedraagt de dropdown zich anders
+  try {
+    await enginesBtn.click({ timeout: 10000 });
+  } catch {
+    // Als de knop niet klikbaar is, gaan we ervan uit dat de enige optie al geselecteerd is
+    return;
+  }
+
+  // Wacht tot er items zichtbaar zijn
+  const items = page.locator(".engines-dropdown__item");
+  const anyItemVisible = await items.first().waitFor({ state: "visible", timeout: 15000 }).then(() => true).catch(() => false);
+
+  if (!anyItemVisible) {
+    // Geen menu zichtbaar gekregen, laat selectie staan
+    return;
+  }
+
+  // Probeer "Alle zoekmachines"
   const allEnginesItem = page
     .locator(".engines-dropdown__item", {
       has: page.locator(".engines-dropdown__item-text span", { hasText: "Alle zoekmachines" }),
     })
     .first();
 
-  await allEnginesItem.waitFor({ state: "visible", timeout: 30000 });
-  await allEnginesItem.click();
+  const hasAllEngines = (await allEnginesItem.count().catch(() => 0)) > 0;
+
+  if (hasAllEngines) {
+    await allEnginesItem.click();
+  } else {
+    // Geen "Alle zoekmachines" aanwezig, kies de eerste optie
+    await items.first().click();
+  }
 
   await page.waitForTimeout(300);
 }
