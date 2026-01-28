@@ -37,6 +37,48 @@ async function saveDebugArtifacts(page, debugDir, prefix) {
   }
 }
 
+async function closeAiSearchNudgeIfPresent(page) {
+  // Amplitude nudge popup (zoals in je HTML snippet)
+  const closeBtn = page.locator(
+    'button[data-testid="nudge-step-close-button"], [data-testid="dismiss"] button[aria-label="Close modal"]'
+  ).first();
+
+  try {
+    // Korte check, geen harde wait
+    const visible = await closeBtn.isVisible().catch(() => false);
+    if (!visible) return false;
+
+    await closeBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(200);
+
+    // Soms zit er nog een overlay, klik nog een keer als hij er nog is
+    const stillVisible = await closeBtn.isVisible().catch(() => false);
+    if (stillVisible) {
+      await closeBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(200);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function safeClick(locator, page, opts = {}) {
+  // Voor klikacties die soms geblokkeerd worden door de popup
+  await closeAiSearchNudgeIfPresent(page);
+
+  try {
+    await locator.click(opts);
+    return;
+  } catch {
+    // Popup kan net opkomen tussen wait en click
+    await closeAiSearchNudgeIfPresent(page);
+    await locator.click({ ...opts, force: true });
+  }
+}
+
+
 function pickCsvFilenameFromHeaders(headers) {
   const cd = headers["content-disposition"] || headers["Content-Disposition"] || "";
   const m = cd.match(/filename="([^"]+)"/i) || cd.match(/filename=([^;]+)/i);
@@ -117,7 +159,7 @@ async function openExportPopup(page) {
     .first();
 
   await topExportBtn.waitFor({ state: "visible", timeout: 120000 });
-  await topExportBtn.click();
+  await safeClick(topExportBtn, page);
 
   // Wacht op de echte popup container
   const popup = page.locator(".se-popup-window-2__box:visible").first();
@@ -259,6 +301,7 @@ async function main() {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(2500);
+    await closeAiSearchNudgeIfPresent(page);
 
     const projectName = await scrapeProjectName(page);
     console.log("Projectnaam:", projectName || "(niet gevonden)");
