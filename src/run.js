@@ -37,43 +37,62 @@ async function saveDebugArtifacts(page, debugDir, prefix) {
   }
 }
 
-async function closeAiSearchNudgeIfPresent(page) {
-  // Amplitude nudge popup (zoals in je HTML snippet)
-  const closeBtn = page.locator(
-    'button[data-testid="nudge-step-close-button"], [data-testid="dismiss"] button[aria-label="Close modal"]'
-  ).first();
+async function forceCloseAiSearchNudge(page, opts = {}) {
+  const {
+    timeoutMs = 15000,
+    pollIntervalMs = 300,
+    maxClicks = 3,
+  } = opts;
 
-  try {
-    // Korte check, geen harde wait
-    const visible = await closeBtn.isVisible().catch(() => false);
-    if (!visible) return false;
+  const closeSelector = 'button[data-testid="nudge-step-close-button"][aria-label="Close modal"]';
 
-    await closeBtn.click({ force: true, timeout: 2000 }).catch(() => {});
-    await page.waitForTimeout(200);
+  const start = Date.now();
+  let clicks = 0;
 
-    // Soms zit er nog een overlay, klik nog een keer als hij er nog is
-    const stillVisible = await closeBtn.isVisible().catch(() => false);
-    if (stillVisible) {
-      await closeBtn.click({ force: true, timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(200);
+  while (Date.now() - start < timeoutMs) {
+    const closeBtn = page.locator(closeSelector).first();
+
+    const isVisible = await closeBtn.isVisible().catch(() => false);
+    if (!isVisible) {
+      // Popup is (nog) niet aanwezig of al weg
+      await page.waitForTimeout(pollIntervalMs);
+      continue;
     }
 
-    return true;
-  } catch {
-    return false;
+    try {
+      await closeBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await closeBtn.click({ force: true, timeout: 2000 });
+      clicks++;
+
+      await page.waitForTimeout(400);
+
+      const stillVisible = await closeBtn.isVisible().catch(() => false);
+      if (!stillVisible) {
+        return true;
+      }
+
+      if (clicks >= maxClicks) {
+        return true;
+      }
+    } catch {
+      await page.waitForTimeout(pollIntervalMs);
+    }
   }
+
+  return false;
 }
+
 
 async function safeClick(locator, page, opts = {}) {
   // Voor klikacties die soms geblokkeerd worden door de popup
-  await closeAiSearchNudgeIfPresent(page);
+  await forceCloseAiSearchNudge(page);
 
   try {
     await locator.click(opts);
     return;
   } catch {
     // Popup kan net opkomen tussen wait en click
-    await closeAiSearchNudgeIfPresent(page);
+    await forceCloseAiSearchNudge(page);
     await locator.click({ ...opts, force: true });
   }
 }
@@ -301,7 +320,7 @@ async function main() {
     console.log("Open:", GUEST_URL);
     await page.goto(GUEST_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(2500);
-    await closeAiSearchNudgeIfPresent(page);
+    await forceCloseAiSearchNudge(page);
 
     const projectName = await scrapeProjectName(page);
     console.log("Projectnaam:", projectName || "(niet gevonden)");
