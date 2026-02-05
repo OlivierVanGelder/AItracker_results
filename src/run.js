@@ -127,54 +127,137 @@ function cleanText(s) {
 }
 
 async function scrapeProjectName(page) {
-  // Zorg dat de nudge popup geen invloed heeft op zichtbaarheid en focus
   await forceCloseAiSearchNudge(page).catch(() => {});
 
-  // 1) Primair: projectnaam uit linker projectselector (jouw HTML)
+  const blacklist = new Set([
+    "SE Ranking",
+    "AI Search",
+    "AI-Resultaten Tracker",
+    "Rankings",
+    "Ranking",
+    "Projecten",
+    "Projects",
+  ]);
+
+  const looksLikeProject = (t) => {
+    const s = cleanText(t);
+    if (!s) return false;
+    if (s.length < 2 || s.length > 200) return false;
+    if (blacklist.has(s)) return false;
+
+    // Vaak is het een domein zoals rbmedia.nl. Sta dat expliciet toe.
+    // Als je ook projecten zonder domein hebt, werkt dit nog steeds door de rest checks.
+    const domainLike = /\b[a-z0-9-]+\.[a-z]{2,}\b/i.test(s);
+
+    // Vermijd pure productnamen of menu labels
+    const tooGeneric =
+      /^se\s*ranking$/i.test(s) ||
+      /^ai\s*search$/i.test(s) ||
+      /^rankings?$/i.test(s);
+
+    if (tooGeneric) return false;
+
+    // Als het domeinachtig is: ok
+    if (domainLike) return true;
+
+    // Anders: accepteer alleen als het niet op een generieke UI label lijkt
+    // (bijv. geen hele korte woorden zoals "Home" of "Menu")
+    if (s.split(" ").length === 1 && s.length <= 4) return false;
+
+    return true;
+  };
+
+  const tryText = async (label, locator, wait = "attached") => {
+    try {
+      const ok = await locator.first().waitFor({ state: wait, timeout: 12000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!ok) return null;
+
+      const txt = cleanText(await locator.first().innerText().catch(() => ""));
+      if (looksLikeProject(txt)) {
+        console.log("Projectnaam bron:", label);
+        return txt;
+      }
+    } catch {}
+    return null;
+  };
+
+  const tryValue = async (label, locator, wait = "attached") => {
+    try {
+      const ok = await locator.first().waitFor({ state: wait, timeout: 12000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!ok) return null;
+
+      const val = cleanText(await locator.first().inputValue().catch(() => ""));
+      if (looksLikeProject(val)) {
+        console.log("Projectnaam bron:", label);
+        return val;
+      }
+    } catch {}
+    return null;
+  };
+
+  // 1) Sidebar project dropdown: native select (komt vaak voor in menu's)
+  // Probeer eerst de value van een select binnen de projecten sectie
+  let found =
+    (await tryValue(
+      "sidebar select value",
+      page.locator(".left-menu select, aside select, nav select")
+    )) ||
+    null;
+  if (found) return found;
+
+  // 2) Sidebar custom dropdown: zichtbare geselecteerde tekst (veel varianten)
+  found =
+    (await tryText(
+      "sidebar selected text",
+      page.locator(
+        ".left-menu-project-select__toggler-button-text, .left-menu-project-select .text-project-name, .left-menu-project-select__toggler, .left-menu .text-project-name"
+      )
+    )) ||
+    null;
+  if (found) return found;
+
+  // 3) Specifiek: active item in de projectlijst (uit jouw HTML snippet)
+  found =
+    (await tryText(
+      "sidebar active item",
+      page.locator(".projects-list-link-list__main-item_active .text-project-name")
+    )) ||
+    null;
+  if (found) return found;
+
+  // 4) Breadcrumbs: liever de eerste die niet generiek is
   try {
-    const leftMenuName = page.locator(
-      ".left-menu-project-select__toggler-button-text"
-    ).first();
+    const crumbLoc = page.locator("a.se-breadcrumbs__link, .se-breadcrumbs__item, .se-breadcrumbs__text");
+    const ok = await crumbLoc.first().waitFor({ state: "attached", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
 
-    await leftMenuName.waitFor({ state: "visible", timeout: 45000 });
+    if (ok) {
+      const all = (await crumbLoc.allInnerTexts().catch(() => []))
+        .map(cleanText)
+        .filter(Boolean);
 
-    const txt = cleanText(await leftMenuName.innerText().catch(() => ""));
-    if (txt && txt.length >= 2 && txt.length <= 200) return txt;
-  } catch {}
-
-  // 2) Secundair: projectnaam uit dropdown actieve item (als toggler om wat voor reden niet zichtbaar is)
-  try {
-    const activeInDropdown = page.locator(
-      ".projects-list-link-list__main-item_active .text-project-name"
-    ).first();
-
-    const visible = await activeInDropdown.isVisible().catch(() => false);
-    if (visible) {
-      const txt = cleanText(await activeInDropdown.innerText().catch(() => ""));
-      if (txt && txt.length >= 2 && txt.length <= 200) return txt;
+      const candidate = all.find((t) => looksLikeProject(t));
+      if (candidate) {
+        console.log("Projectnaam bron: breadcrumbs");
+        return candidate;
+      }
     }
   } catch {}
 
-  // 3) Fallback: breadcrumbs, maar filter generieke items
-  try {
-    const blacklist = new Set(["AI Search", "AI-Resultaten Tracker", "Rankings", "Ranking"]);
-
-    const breadcrumbLinks = page.locator("a.se-breadcrumbs__link");
-    const all = await breadcrumbLinks.allInnerTexts().catch(() => []);
-    const texts = all.map(cleanText).filter(Boolean);
-
-    const candidate = texts.find((t) => {
-      if (t.length < 2 || t.length > 140) return false;
-      if (blacklist.has(t)) return false;
-      return true;
-    });
-
-    if (candidate) return candidate;
-  } catch {}
-
-  // 4) Laatste fallback: title
+  // 5) Laatste fallback: title, maar nooit "SE Ranking"
   const title = cleanText(await page.title().catch(() => ""));
-  return title && title.length <= 200 ? title : "";
+  if (looksLikeProject(title)) {
+    console.log("Projectnaam bron: title");
+    return title;
+  }
+
+  console.log("Projectnaam niet gevonden, return leeg");
+  return "";
 }
 
 
