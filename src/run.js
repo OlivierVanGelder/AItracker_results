@@ -127,16 +127,56 @@ function cleanText(s) {
 }
 
 async function scrapeProjectName(page) {
+  // Zorg dat de nudge popup geen invloed heeft op zichtbaarheid en focus
+  await forceCloseAiSearchNudge(page).catch(() => {});
+
+  // 1) Primair: projectnaam uit linker projectselector (jouw HTML)
   try {
-    const breadcrumbLink = page.locator("a.se-breadcrumbs__link").first();
-    await breadcrumbLink.waitFor({ state: "visible", timeout: 45000 });
-    const txt = cleanText(await breadcrumbLink.innerText().catch(() => ""));
-    if (txt && txt.length >= 2 && txt.length <= 140) return txt;
+    const leftMenuName = page.locator(
+      ".left-menu-project-select__toggler-button-text"
+    ).first();
+
+    await leftMenuName.waitFor({ state: "visible", timeout: 45000 });
+
+    const txt = cleanText(await leftMenuName.innerText().catch(() => ""));
+    if (txt && txt.length >= 2 && txt.length <= 200) return txt;
   } catch {}
 
+  // 2) Secundair: projectnaam uit dropdown actieve item (als toggler om wat voor reden niet zichtbaar is)
+  try {
+    const activeInDropdown = page.locator(
+      ".projects-list-link-list__main-item_active .text-project-name"
+    ).first();
+
+    const visible = await activeInDropdown.isVisible().catch(() => false);
+    if (visible) {
+      const txt = cleanText(await activeInDropdown.innerText().catch(() => ""));
+      if (txt && txt.length >= 2 && txt.length <= 200) return txt;
+    }
+  } catch {}
+
+  // 3) Fallback: breadcrumbs, maar filter generieke items
+  try {
+    const blacklist = new Set(["AI Search", "AI-Resultaten Tracker", "Rankings", "Ranking"]);
+
+    const breadcrumbLinks = page.locator("a.se-breadcrumbs__link");
+    const all = await breadcrumbLinks.allInnerTexts().catch(() => []);
+    const texts = all.map(cleanText).filter(Boolean);
+
+    const candidate = texts.find((t) => {
+      if (t.length < 2 || t.length > 140) return false;
+      if (blacklist.has(t)) return false;
+      return true;
+    });
+
+    if (candidate) return candidate;
+  } catch {}
+
+  // 4) Laatste fallback: title
   const title = cleanText(await page.title().catch(() => ""));
   return title && title.length <= 200 ? title : "";
 }
+
 
 function buildWebhookUrl(baseUrl, meta) {
   const u = new URL(baseUrl);
@@ -324,6 +364,7 @@ async function main() {
 
     const projectName = await scrapeProjectName(page);
     console.log("Projectnaam:", projectName || "(niet gevonden)");
+
 
     const meta = { project: projectName || "", guestUrl: GUEST_URL };
 
