@@ -137,124 +137,95 @@ async function scrapeProjectName(page) {
     "Ranking",
     "Projecten",
     "Projects",
+    "keyboard_arrow_down",
+    "expand_more",
+    "keyboard_arrow_downexpand_more",
   ]);
 
-  const looksLikeProject = (t) => {
+  const looksOk = (t) => {
     const s = cleanText(t);
     if (!s) return false;
     if (s.length < 2 || s.length > 200) return false;
     if (blacklist.has(s)) return false;
 
-    // Vaak is het een domein zoals rbmedia.nl. Sta dat expliciet toe.
-    // Als je ook projecten zonder domein hebt, werkt dit nog steeds door de rest checks.
-    const domainLike = /\b[a-z0-9-]+\.[a-z]{2,}\b/i.test(s);
-
-    // Vermijd pure productnamen of menu labels
-    const tooGeneric =
-      /^se\s*ranking$/i.test(s) ||
-      /^ai\s*search$/i.test(s) ||
-      /^rankings?$/i.test(s);
-
-    if (tooGeneric) return false;
-
-    // Als het domeinachtig is: ok
-    if (domainLike) return true;
-
-    // Anders: accepteer alleen als het niet op een generieke UI label lijkt
-    // (bijv. geen hele korte woorden zoals "Home" of "Menu")
-    if (s.split(" ").length === 1 && s.length <= 4) return false;
+    // filter icon restjes
+    if (/keyboard_arrow|expand_more|unfold_more/i.test(s)) return false;
 
     return true;
   };
 
-  const tryText = async (label, locator, wait = "attached") => {
-    try {
-      const ok = await locator.first().waitFor({ state: wait, timeout: 12000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!ok) return null;
-
-      const txt = cleanText(await locator.first().innerText().catch(() => ""));
-      if (looksLikeProject(txt)) {
-        console.log("Projectnaam bron:", label);
-        return txt;
-      }
-    } catch {}
-    return null;
-  };
-
-  const tryValue = async (label, locator, wait = "attached") => {
-    try {
-      const ok = await locator.first().waitFor({ state: wait, timeout: 12000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!ok) return null;
-
-      const val = cleanText(await locator.first().inputValue().catch(() => ""));
-      if (looksLikeProject(val)) {
-        console.log("Projectnaam bron:", label);
-        return val;
-      }
-    } catch {}
-    return null;
-  };
-
-  // 1) Sidebar project dropdown: native select (komt vaak voor in menu's)
-  // Probeer eerst de value van een select binnen de projecten sectie
-  let found =
-    (await tryValue(
-      "sidebar select value",
-      page.locator(".left-menu select, aside select, nav select")
-    )) ||
-    null;
-  if (found) return found;
-
-  // 2) Sidebar custom dropdown: zichtbare geselecteerde tekst (veel varianten)
-  found =
-    (await tryText(
-      "sidebar selected text",
-      page.locator(
-        ".left-menu-project-select__toggler-button-text, .left-menu-project-select .text-project-name, .left-menu-project-select__toggler, .left-menu .text-project-name"
-      )
-    )) ||
-    null;
-  if (found) return found;
-
-  // 3) Specifiek: active item in de projectlijst (uit jouw HTML snippet)
-  found =
-    (await tryText(
-      "sidebar active item",
-      page.locator(".projects-list-link-list__main-item_active .text-project-name")
-    )) ||
-    null;
-  if (found) return found;
-
-  // 4) Breadcrumbs: liever de eerste die niet generiek is
+  // 1) Primair: exact het tekstdivje met de projectnaam (jouw HTML snippet)
   try {
-    const crumbLoc = page.locator("a.se-breadcrumbs__link, .se-breadcrumbs__item, .se-breadcrumbs__text");
-    const ok = await crumbLoc.first().waitFor({ state: "attached", timeout: 8000 })
+    const nameDiv = page.locator(".left-menu-project-select__toggler-button-text").first();
+    const ok = await nameDiv.waitFor({ state: "attached", timeout: 15000 })
       .then(() => true)
       .catch(() => false);
 
     if (ok) {
-      const all = (await crumbLoc.allInnerTexts().catch(() => []))
+      const txt = cleanText(await nameDiv.innerText().catch(() => ""));
+      if (looksOk(txt)) {
+        console.log("Projectnaam bron: left-menu name div");
+        return txt;
+      }
+    }
+  } catch {}
+
+  // 2) Als de sidebar een native select gebruikt: pak geselecteerde option tekst
+  try {
+    const select = page.locator(".left-menu select, aside select, nav select").first();
+    const ok = await select.waitFor({ state: "attached", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (ok) {
+      const selectedText = await select.evaluate((el) => {
+        const opt = el.selectedOptions && el.selectedOptions[0];
+        return (opt && opt.textContent) ? opt.textContent.trim() : "";
+      }).catch(() => "");
+
+      const txt = cleanText(selectedText);
+      if (looksOk(txt)) {
+        console.log("Projectnaam bron: sidebar select selected option");
+        return txt;
+      }
+    }
+  } catch {}
+
+  // 3) Dropdown lijst: actieve item (jouw HTML snippet bevat dit ook)
+  try {
+    const active = page.locator(".projects-list-link-list__main-item_active .text-project-name").first();
+    const ok = await active.waitFor({ state: "attached", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (ok) {
+      const txt = cleanText(await active.innerText().catch(() => ""));
+      if (looksOk(txt)) {
+        console.log("Projectnaam bron: active dropdown item");
+        return txt;
+      }
+    }
+  } catch {}
+
+  // 4) Breadcrumbs als fallback, maar filter generieke items
+  try {
+    const crumbs = page.locator("a.se-breadcrumbs__link").first();
+    const ok = await crumbs.waitFor({ state: "attached", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (ok) {
+      const all = (await page.locator("a.se-breadcrumbs__link").allInnerTexts().catch(() => []))
         .map(cleanText)
         .filter(Boolean);
 
-      const candidate = all.find((t) => looksLikeProject(t));
+      const candidate = all.find((t) => looksOk(t));
       if (candidate) {
         console.log("Projectnaam bron: breadcrumbs");
         return candidate;
       }
     }
   } catch {}
-
-  // 5) Laatste fallback: title, maar nooit "SE Ranking"
-  const title = cleanText(await page.title().catch(() => ""));
-  if (looksLikeProject(title)) {
-    console.log("Projectnaam bron: title");
-    return title;
-  }
 
   console.log("Projectnaam niet gevonden, return leeg");
   return "";
