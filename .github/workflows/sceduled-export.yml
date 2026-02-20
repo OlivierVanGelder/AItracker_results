@@ -3,8 +3,8 @@ name: Scheduled SE Ranking export
 on:
   workflow_dispatch:
     inputs:
-      guestUrl:
-        description: SE Ranking guest URL (optioneel, overschrijft secret)
+      guestUrls:
+        description: SE Ranking guest URLs, komma gescheiden (optioneel, overschrijft secret)
         required: false
         type: string
 
@@ -30,12 +30,13 @@ jobs:
 
       - name: Run exporter
         env:
+          SE_RANKING_GUEST_URLS: ${{ secrets.SE_RANKING_GUEST_URLS }}
           SE_RANKING_GUEST_URL: ${{ secrets.SE_RANKING_GUEST_URL }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           EXPORT_TIMEOUT_MS: "120000"
         run: |
           node src/run.js \
-            ${{ inputs.guestUrl && format('--guestUrl "{0}"', inputs.guestUrl) || '' }}
+            ${{ inputs.guestUrls && format('--guestUrls "{0}"', inputs.guestUrls) || '' }}
 
       - name: Upload debug artifacts
         if: always()
